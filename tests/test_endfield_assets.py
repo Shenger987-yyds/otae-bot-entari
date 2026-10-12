@@ -306,24 +306,26 @@ class EndfieldAssetFetchTests(unittest.TestCase):
 
         with health_module.track_render_health() as health, patch.object(draw, "fetch_many_resilient", side_effect=fake_fetch):
             prepared = asyncio.run(draw._prepare_operator_card_html(view, inline=True))
-        return prepared.html, requested, health, portrait
+        return prepared, requested, health, portrait
 
     def test_operator_card_art_slot_uses_portrait_not_avatar(self):
         # /zmd 啥子：陈千语的立绘位必须是 characterportrait，而不是头像。
-        html, requested, health, portrait = self._chen_qianyu_card(portrait_ok=True)
+        prepared, requested, health, portrait = self._chen_qianyu_card(portrait_ok=True)
         self.assertEqual(requested, [portrait])
         art = base64.b64encode(b"art:" + portrait.encode()).decode("ascii")
-        self.assertIn(f'<img src="data:image/png;base64,{art}" alt="陈千语">', html)
+        self.assertIn(f'<img src="data:image/png;base64,{art}" alt="陈千语">', prepared.html)
         self.assertTrue(health.complete)
+        self.assertTrue(prepared.complete)
 
     def test_operator_card_portrait_miss_never_falls_back_to_avatar(self):
         # characterportrait 原图十几 MB，超出素材预算时曾拿 charremoteicon 头像顶替，
         # 且整卡仍算完整被缓存；现在立绘位留空，整卡标记缺图不进缓存。
-        html, requested, health, portrait = self._chen_qianyu_card(portrait_ok=False)
+        prepared, requested, health, portrait = self._chen_qianyu_card(portrait_ok=False)
         self.assertEqual(requested, [portrait])
-        self.assertNotIn('alt="陈千语"', html)
-        self.assertIn('<div class="portrait-fallback">陈</div>', html)
+        self.assertNotIn('alt="陈千语"', prepared.html)
+        self.assertIn('<div class="portrait-fallback">陈</div>', prepared.html)
         self.assertFalse(health.complete)
+        self.assertFalse(prepared.complete)
 
     def test_nested_weapon_info_tags_render_inner_key(self):
         draw = _load_draw()

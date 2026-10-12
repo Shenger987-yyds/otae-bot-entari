@@ -490,6 +490,40 @@ async def _cache_coordinates(
     return key, eligible, disk_key, ttl_seconds
 
 
+async def _alias_disk_keys(
+    url: str,
+    disk_aliases: Sequence[str],
+    *,
+    namespace: str,
+    response_kind: str,
+    params: Mapping[str, Any] | Sequence[tuple[str, Any]] | None,
+    headers: Mapping[str, str] | None,
+    ttl_seconds: float,
+) -> list[tuple[str, str]]:
+    """(namespace, disk key) rows other namespaces would store this public image under.
+
+    The disk key includes the namespace, so a copy another feature already
+    downloaded for the same URL is invisible without this. Images only.
+    """
+    keys: list[tuple[str, str]] = []
+    for alias in dict.fromkeys(disk_aliases):
+        if alias == namespace or not public_image_request(
+            url, alias, headers, params, response_kind
+        ):
+            continue
+        _key, eligible, disk_key, _ttl = await _cache_coordinates(
+            url,
+            namespace=alias,
+            response_kind=response_kind,
+            params=params,
+            headers=headers,
+            ttl_seconds=ttl_seconds,
+        )
+        if eligible:
+            keys.append((alias, disk_key))
+    return keys
+
+
 async def cached_public_resource(
     url: str,
     *,
@@ -499,6 +533,7 @@ async def cached_public_resource(
     headers: Mapping[str, str] | None = None,
     ttl_seconds: float = DEFAULT_CACHE_TTL_SECONDS,
     asset: bool = False,
+    disk_aliases: Sequence[str] = (),
 ) -> bool:
     """True when memory or disk metadata can serve this request without a body read."""
     if asset:
@@ -519,12 +554,28 @@ async def cached_public_resource(
         url, namespace, headers, params, response_kind
     )
     disk = public_tables if table_eligible else public_images
+    disk_ttl, pinned = _disk_lifetime(url, ttl_seconds)
     try:
         meta = await asyncio.to_thread(disk.metadata, disk_key)
+        if _disk_metadata_reusable(meta, ttl_seconds=disk_ttl, pinned=pinned):
+            return True
+        if table_eligible:
+            return False
+        for _alias, alias_key in await _alias_disk_keys(
+            url,
+            disk_aliases,
+            namespace=namespace,
+            response_kind=response_kind,
+            params=params,
+            headers=headers,
+            ttl_seconds=ttl_seconds,
+        ):
+            meta = await asyncio.to_thread(disk.metadata, alias_key)
+            if _disk_metadata_reusable(meta, ttl_seconds=disk_ttl, pinned=pinned):
+                return True
     except (OSError, sqlite3.Error):
         return False
-    disk_ttl, pinned = _disk_lifetime(url, ttl_seconds)
-    return _disk_metadata_reusable(meta, ttl_seconds=disk_ttl, pinned=pinned)
+    return False
 
 
 async def _fetch_resource(
@@ -539,6 +590,7 @@ async def _fetch_resource(
     max_bytes: int,
     validator: Callable[[HttpResource], object] | None = None,
     asset: bool = False,
+    disk_aliases: Sequence[str] = (),
 ) -> HttpResource:
     key, eligible, disk_key, ttl_seconds = await _cache_coordinates(
         url,
@@ -573,9 +625,27 @@ async def _fetch_resource(
 
     async def request() -> HttpResource:
         cached = None
+        # The row a 304 refreshes: ours, or the alias row the copy came from.
+        row_key, row_namespace, row_generation = disk_key, namespace, generation
         if eligible:
             try:
                 cached = await asyncio.to_thread(disk.get, disk_key, max_bytes)
+                if cached is None and not table_eligible:
+                    for alias, alias_key in await _alias_disk_keys(
+                        url,
+                        disk_aliases,
+                        namespace=namespace,
+                        response_kind=response_kind,
+                        params=params,
+                        headers=headers,
+                        ttl_seconds=ttl_seconds,
+                    ):
+                        cached = await asyncio.to_thread(disk.get, alias_key, max_bytes)
+                        if cached is not None:
+                            row_key, row_namespace = alias_key, alias
+                            row_generation = disk.register(alias)
+                            _cache_event(key, "alias_disk_hits", 1)
+                            break
             except (OSError, sqlite3.Error):
                 _cache_event(key, "disk_errors", 1)
         if cached is not None:
@@ -657,12 +727,12 @@ async def _fetch_resource(
                 if resource.status_code == 304 and cached is not None:
                     # Same bytes: refresh validators and freshness, keep the stored body.
                     disk.refresh_later(
-                        disk_key,
-                        namespace,
+                        row_key,
+                        row_namespace,
                         DiskImageMeta(
                             validated_at, max_age, resource.etag, resource.modified
                         ),
-                        generation,
+                        row_generation,
                     )
                 else:
                     disk.put_later(
@@ -710,8 +780,13 @@ async def fetch_bytes(
     ttl_seconds: float = DEFAULT_CACHE_TTL_SECONDS,
     max_bytes: int = DEFAULT_MAX_RESOURCE_BYTES,
     asset: bool = False,
+    disk_aliases: Sequence[str] = (),
 ) -> HttpResource:
-    """``asset=True`` 走素材通道：独立并发、短连接超时、按主机熔断、可选代理与主机改写。"""
+    """``asset=True`` 走素材通道：独立并发、短连接超时、按主机熔断、可选代理与主机改写。
+
+    ``disk_aliases``：同一公共图片 URL 也可能由这些命名空间存过磁盘副本；
+    自己的副本缺失时借用它们（字节相同，谁下载的都一样）。
+    """
     if asset:
         url = rewrite_asset_url(url)
         if timeout_seconds is None:
@@ -728,6 +803,7 @@ async def fetch_bytes(
         ttl_seconds=ttl_seconds,
         max_bytes=max_bytes,
         asset=asset,
+        disk_aliases=disk_aliases,
     )
 
 
@@ -824,6 +900,7 @@ async def fetch_many_resilient(
     base_delay_seconds: float = 0.25,
     log_prefix: str = "[assets]",
     budget_seconds: float | None = None,
+    disk_aliases: Sequence[str] = (),
 ) -> tuple[dict[str, HttpResource | None], dict[str, str]]:
     """并发取多个素材，对间歇性失败退避重试，并返回失败原因。
 
@@ -834,6 +911,7 @@ async def fetch_many_resilient(
        设定的整卡截止时间），到点不再等待，未取到的按缺失返回；
     4. 放弃的原因会写进日志，调用方不再只看到「少了几张图」。
     5. 重新校验失败或到点没取到时，有旧磁盘副本就用旧图（stale=True），不算失败。
+    6. ``disk_aliases`` 里的命名空间若已存过同一 URL 的磁盘副本，自己缺副本时借用（见 fetch_bytes）。
     第一项覆盖**每一个**请求过的 url（失败为 None），第二项只保留最终失败原因，
     调用方既不会悄悄少图，也能决定是否把失败详情带入诊断信息。
     """
@@ -861,6 +939,7 @@ async def fetch_many_resilient(
                     ttl_seconds=ttl_seconds,
                     max_bytes=max_bytes,
                     asset=True,
+                    disk_aliases=disk_aliases,
                 )
                 for url in pending
             ),
@@ -896,6 +975,7 @@ async def fetch_many_resilient(
                 headers=headers,
                 ttl_seconds=ttl_seconds,
                 max_bytes=max_bytes,
+                disk_aliases=disk_aliases,
             )
         except (OSError, sqlite3.Error, httpx.HTTPError) as exc:
             logger.debug(f"{log_prefix} stale lookup failed: {type(exc).__name__}")
@@ -926,8 +1006,12 @@ async def _stale_copies(
     headers: Mapping[str, str] | None,
     ttl_seconds: float,
     max_bytes: int,
+    disk_aliases: Sequence[str] = (),
 ) -> dict[str, HttpResource]:
-    """Disk copies of any age for asset URLs a batch could not fetch in time."""
+    """Disk copies of any age for asset URLs a batch could not fetch in time.
+
+    Our own row first, then rows ``disk_aliases`` namespaces stored for the URL.
+    """
     lookups = []
     for url in urls:
         target = rewrite_asset_url(url)
@@ -940,24 +1024,35 @@ async def _stale_copies(
             ttl_seconds=ttl_seconds,
         )
         if eligible:
-            lookups.append((url, target, disk_key))
+            aliases = await _alias_disk_keys(
+                target,
+                disk_aliases,
+                namespace=namespace,
+                response_kind="bytes",
+                params=None,
+                headers=headers,
+                ttl_seconds=ttl_seconds,
+            )
+            lookups.append((url, target, (disk_key, *(key for _ns, key in aliases))))
     if not lookups:
         return {}
     disk = public_images
 
     def read() -> dict[str, HttpResource]:
         found = {}
-        for url, target, disk_key in lookups:
-            image = disk.get(disk_key, max_bytes)
-            if image is not None:
-                found[url] = HttpResource(
-                    image.content,
-                    image.content_type,
-                    200,
-                    target,
-                    expires_at=time.time(),
-                    stale=True,
-                )
+        for url, target, disk_keys in lookups:
+            for disk_key in disk_keys:
+                image = disk.get(disk_key, max_bytes)
+                if image is not None:
+                    found[url] = HttpResource(
+                        image.content,
+                        image.content_type,
+                        200,
+                        target,
+                        expires_at=time.time(),
+                        stale=True,
+                    )
+                    break
         return found
 
     return await asyncio.to_thread(read)

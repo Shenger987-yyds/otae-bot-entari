@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import tempfile
 import unittest
@@ -247,6 +248,180 @@ class HttpCacheRepairTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(self.disk.path.exists())
         self.assertEqual((await http.get_http_cache_stats()).entries, 0)
+
+
+class OperatorPortraitDiskAliasTests(unittest.IsolatedAsyncioTestCase):
+    """洛茜：立绘原图已由抽卡横幅（另一个命名空间）存进磁盘，干员卡却留空。"""
+
+    async def asyncSetUp(self):
+        from plugins.endfield.providers.assets import operator_portrait_urls
+        from plugins.endfield.rendering.cards import OperatorView
+
+        await http.close_http_client()
+        await endfield._CARD_CACHE.clear()
+        self.directory = tempfile.TemporaryDirectory()
+        self.disk = PublicImageDiskCache(
+            Path(self.directory.name) / "images.sqlite3", 1024 * 1024
+        )
+        self.patcher = patch.object(http, "public_images", self.disk)
+        self.patcher.start()
+        self.portrait = operator_portrait_urls("chr_0028_wulfa")[0]
+        self.view = OperatorView(
+            name="洛茜",
+            slug="干员/洛茜",
+            operator_id="chr_0028_wulfa",
+            english_name="Rossi",
+            portrait_url=self.portrait,
+        )
+        self.requested: list[tuple[str, str | None]] = []
+        self.network = "hang"
+        self.release = asyncio.Event()
+
+        async def handle(request):
+            self.requested.append((str(request.url), request.headers.get("if-none-match")))
+            if self.network == "serve":
+                return httpx.Response(
+                    200,
+                    content=b"wulfa-portrait",
+                    headers={"content-type": "image/png", "etag": '"v1"'},
+                )
+            if self.network == "304" and request.headers.get("if-none-match") == '"v1"':
+                return httpx.Response(304, headers={"etag": '"v1"'})
+            await self.release.wait()  # 冷下载超出整卡素材预算
+            return httpx.Response(503)
+
+        http._asset_client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+
+    async def asyncTearDown(self):
+        self.release.set()
+        await endfield._CARD_CACHE.clear()
+        await http.close_http_client()
+        self.patcher.stop()
+        self.directory.cleanup()
+
+    async def seed_gacha_banner(self, *, age: float = 0.0):
+        from plugins.endfield.gacha.assets import EndfieldGachaAssetCache
+
+        self.network = "serve"
+        gacha = EndfieldGachaAssetCache(SimpleNamespace(), cache_dir=self.directory.name)
+        with patch.object(http.time, "time", return_value=http.time.time() - age):
+            fetched = await gacha._fetch_image_urls([self.portrait])
+        self.assertEqual(fetched[self.portrait].content, b"wulfa-portrait")
+        self.assertTrue(self.disk.flush(5))
+        await http.clear_http_cache(include_disk=False)
+        self.requested.clear()
+        self.network = "hang"
+
+    async def operator_card(self):
+        from otae_bot.infrastructure.http.asset_policy import asset_render_budget
+        from plugins.endfield.rendering import cards
+        from plugins.endfield.rendering.health import track_render_health
+
+        with track_render_health() as health, asset_render_budget(0.5):
+            prepared = await cards._prepare_operator_card_html(self.view, inline=True)
+        return prepared, health
+
+    def assert_portrait(self, prepared, health):
+        art = base64.b64encode(b"wulfa-portrait").decode("ascii")
+        self.assertIn(f'<img src="data:image/png;base64,{art}" alt="洛茜">', prepared.html)
+        self.assertTrue(health.complete)
+        self.assertTrue(prepared.complete)
+        avatars = ("/charremoteicon/", "/charicon/", "/charroundicon/")
+        self.assertFalse(
+            [url for url, _tag in self.requested if any(part in url for part in avatars)]
+        )
+
+    def rows(self):
+        connection = self.disk._connect()
+        return connection.execute(
+            "SELECT namespace, validated_at FROM public_images_v1"
+        ).fetchall()
+
+    async def test_disk_copy_from_gacha_banner_paints_portrait_without_network(self):
+        await self.seed_gacha_banner()
+        self.assertFalse(
+            await http.cached_public_resource(
+                self.portrait, namespace="endfield-assets", response_kind="bytes", asset=True
+            )
+        )
+        from plugins.endfield.cold_start import remote_assets_cold
+
+        self.assertFalse(await remote_assets_cold([self.portrait], namespace="endfield-assets"))
+        prepared, health = await self.operator_card()
+        self.assert_portrait(prepared, health)
+        self.assertEqual(self.requested, [])
+
+    async def test_stale_gacha_copy_is_revalidated_in_place(self):
+        await self.seed_gacha_banner(age=7200)
+        self.network = "304"
+        prepared, health = await self.operator_card()
+        self.assert_portrait(prepared, health)
+        self.assertEqual(self.requested, [(self.portrait, '"v1"')])
+        self.assertTrue(self.disk.flush(5))
+        # 304 刷新的是借来的那一行，不再复制一份十几 MB 的立绘。
+        (row,) = self.rows()
+        self.assertEqual(row[0], "endfield-gacha-images")
+        self.assertGreater(row[1], http.time.time() - 60)
+
+    async def test_stale_gacha_copy_paints_when_revalidation_misses_budget(self):
+        await self.seed_gacha_banner(age=7200)
+        prepared, health = await self.operator_card()
+        self.assert_portrait(prepared, health)
+        self.assertEqual(self.requested, [(self.portrait, '"v1"')])
+
+    async def test_gacha_banner_borrows_operator_card_copy(self):
+        from otae_bot.infrastructure.http.asset_policy import asset_render_budget
+        from plugins.endfield.gacha.assets import EndfieldGachaAssetCache
+
+        self.network = "serve"
+        await self.operator_card()
+        self.assertTrue(self.disk.flush(5))
+        await http.clear_http_cache(include_disk=False)
+        self.requested.clear()
+        self.network = "hang"
+        gacha = EndfieldGachaAssetCache(SimpleNamespace(), cache_dir=self.directory.name)
+        with asset_render_budget(0.5):
+            fetched = await gacha._fetch_image_urls([self.portrait])
+        self.assertEqual(fetched[self.portrait].content, b"wulfa-portrait")
+        self.assertEqual(self.requested, [])
+
+    async def test_true_miss_leaves_placeholder_and_never_requests_avatar(self):
+        prepared, health = await self.operator_card()
+        self.assertNotIn('alt="洛茜"', prepared.html)
+        self.assertIn('<div class="portrait-fallback">洛</div>', prepared.html)
+        self.assertEqual({url for url, _tag in self.requested}, {self.portrait})
+        self.assertFalse(health.complete)
+        self.assertFalse(prepared.complete)
+
+    async def test_card_cache_skips_blank_portrait_and_keeps_painted_one(self):
+        from otae_bot.infrastructure.http.asset_policy import asset_render_budget
+        from plugins.endfield.rendering import cards
+
+        htmls: list[str] = []
+
+        async def draw(view):
+            htmls.append((await cards.prepare_operator_card_html(view)).html)
+            return b"png"
+
+        candidate = endfield.EndfieldCandidate("operator", "干员/洛茜", "洛茜", 100, "fz")
+        with (
+            patch.object(
+                endfield.service,
+                "get_operator_view_from_fz",
+                AsyncMock(return_value=self.view),
+            ),
+            patch.object(endfield, "draw_operator_card", side_effect=draw),
+            asset_render_budget(0.5),
+        ):
+            for _ in range(2):
+                self.assertEqual(await endfield._render_candidate(candidate), (b"png",))
+            self.assertEqual(len(htmls), 2)
+            self.assertTrue(all('alt="洛茜"' not in html for html in htmls))
+            await self.seed_gacha_banner()
+            for _ in range(2):
+                self.assertEqual(await endfield._render_candidate(candidate), (b"png",))
+        self.assertEqual(len(htmls), 3)
+        self.assertIn('alt="洛茜"', htmls[-1])
 
 
 class DiskCacheTests(unittest.TestCase):

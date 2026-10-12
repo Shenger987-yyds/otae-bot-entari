@@ -16,6 +16,7 @@ from otae_bot.infrastructure.http.asset_policy import asset_render_budget
 from otae_bot.infrastructure.http.client import fetch_many_resilient
 
 from ..account.store import GachaRecord
+from ..cold_start import GACHA_IMAGE_NAMESPACE, shared_image_namespaces
 from ..providers.assets import item_icon_urls, operator_icon_urls, operator_portrait_urls, unique_urls
 from ..catalog.service import EndfieldService
 from .pools import kind_for_record, resolve_pool_kind, series_key as build_series_key
@@ -24,7 +25,7 @@ from .pools import kind_for_record, resolve_pool_kind, series_key as build_serie
 GACHA_CACHE_DIR = Path("data") / "endfield" / "image_cache"
 CATALOG_CACHE_PATH = GACHA_CACHE_DIR / "catalog.json"
 CATALOG_TTL_SECONDS = 24 * 60 * 60
-IMAGE_NAMESPACE = "endfield-gacha-images"
+IMAGE_NAMESPACE = GACHA_IMAGE_NAMESPACE
 POOL_ARTICLE_PREFIX = "卡池/"
 KEEPSAKE_ARTICLE_PREFIX = "物品/干员信物/"
 IMAGE_FETCH_MAX_BYTES = 24 * 1024 * 1024
@@ -525,6 +526,7 @@ class EndfieldGachaAssetCache:
             namespace=IMAGE_NAMESPACE,
             max_bytes=IMAGE_FETCH_MAX_BYTES,
             log_prefix="[endfield-gacha]",
+            disk_aliases=shared_image_namespaces(IMAGE_NAMESPACE),
         )
         if isinstance(fetched, tuple):
             resources, _failures = fetched

@@ -32,7 +32,20 @@ COLD_START_NOTICE = "终末地数据正在初次加载，预计耗时约十余�
 
 REMOTE_ASSET_NAMESPACE = "endfield-assets"
 ACCOUNT_UI_ASSET_NAMESPACE = "endfield-account-ui-assets"
+GACHA_IMAGE_NAMESPACE = "endfield-gacha-images"
 _ASSET_NAMESPACES = {REMOTE_ASSET_NAMESPACE, ACCOUNT_UI_ASSET_NAMESPACE}
+# 资料卡与抽卡横幅按同一 URL 取 characterportrait 立绘与物品图标，磁盘缓存键却带命名空间：
+# 立绘原图十几 MB，抽卡横幅已存过的副本干员卡查不到，只能冷下载到超出预算、立绘位留空。
+# 两边互相借用对方的磁盘副本（公共图片，谁下载的字节都一样）。
+_SHARED_IMAGE_NAMESPACES = {
+    REMOTE_ASSET_NAMESPACE: (GACHA_IMAGE_NAMESPACE,),
+    GACHA_IMAGE_NAMESPACE: (REMOTE_ASSET_NAMESPACE,),
+}
+
+
+def shared_image_namespaces(namespace: str) -> tuple[str, ...]:
+    """Namespaces whose public-image disk copies ``namespace`` may borrow."""
+    return _SHARED_IMAGE_NAMESPACES.get(namespace, ())
 
 _FZ_CATALOG_TITLES = {"operator": "干员", "weapon": "武器", "equipment": "装备"}
 _FZ_TITLE_PREFIXES = {"operator": "干员/", "weapon": "武器/", "equipment": "装备/"}
@@ -186,6 +199,7 @@ async def remote_assets_cold(urls: Iterable[Any], *, namespace: str) -> bool:
             namespace=namespace,
             response_kind="bytes",
             asset=True,
+            disk_aliases=shared_image_namespaces(namespace),
         ):
             return True
     return False

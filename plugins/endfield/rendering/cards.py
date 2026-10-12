@@ -28,7 +28,7 @@ from PIL import Image
 from otae_bot.infrastructure.http.asset_policy import asset_render_budget
 from otae_bot.infrastructure.http.client import fetch_many_resilient
 
-from ..cold_start import note_remote_assets
+from ..cold_start import note_remote_assets, shared_image_namespaces
 from otae_bot.infrastructure.rendering.executor import run_image_render
 from otae_bot.infrastructure.rendering.browser import BrowserResource, screenshot_web_element
 from otae_bot.infrastructure.rendering.temp_files import schedule_temp_file_cleanup
@@ -2195,6 +2195,7 @@ async def _prepare_operator_card_html(view: OperatorView, *, inline: bool) -> Pr
         _render_html(view, mapped.get("portrait", ""), skill_icons, talent_icons, term_styles, term_icons, layout),
         assets.resources,
         OPERATOR_CARD_WIDTH,
+        complete=all(mapped.get(key) or not urls for key, urls in groups.items()),
     )
 
 
@@ -3579,6 +3580,7 @@ async def _prepare_assets(urls: Iterable[str], *, inline: bool) -> _PreparedAsse
         base_delay_seconds=ASSET_RETRY_BASE_DELAY_SECONDS,
         max_bytes=ASSET_FETCH_MAX_BYTES,
         log_prefix="[endfield]",
+        disk_aliases=shared_image_namespaces(REMOTE_ASSET_NAMESPACE),
     )
     # Accept the former mapping shape as well so existing render-test doubles
     # and hot-reloaded callers do not fail while this shared API rolls over.
