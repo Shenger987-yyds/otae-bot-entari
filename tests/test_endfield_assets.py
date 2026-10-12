@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import importlib.util
 import sys
 import types
@@ -276,6 +277,53 @@ class EndfieldAssetFetchTests(unittest.TestCase):
             )
         self.assertIn("akedata.wiki", sources["icon"])
         self.assertTrue(mapped["icon"].startswith("data:image/png;base64,"))
+
+    def _chen_qianyu_card(self, portrait_ok: bool):
+        draw = _load_draw()
+        health_module = sys.modules["endfield_asset_test.rendering.health"]
+        from otae_bot.infrastructure.http.client import HttpResource
+
+        portrait = f"{AKEDATA_SPRITES_BASE}/characterportrait/chr_0005_chen.png"
+        view = _operator(
+            name="陈千语",
+            slug="chr_0005_chen",
+            operator_id="chr_0005_chen",
+            english_name="Chen Qianyu",
+            icon_url=f"{AKEDATA_SPRITES_BASE}/charremoteicon/icon_chr_0005_chen.png",
+            round_icon_url=f"{AKEDATA_SPRITES_BASE}/charroundicon/icon_round_chr_0005_chen.png",
+            portrait_url=portrait,
+        )
+        requested: list[str] = []
+
+        async def fake_fetch(urls, **_kwargs):
+            urls = list(urls)
+            requested.extend(urls)
+            resolved = {
+                url: None if url == portrait and not portrait_ok else HttpResource(b"art:" + url.encode(), "image/png", 200, url)
+                for url in urls
+            }
+            return resolved, {url: "deadline" for url, item in resolved.items() if item is None}
+
+        with health_module.track_render_health() as health, patch.object(draw, "fetch_many_resilient", side_effect=fake_fetch):
+            prepared = asyncio.run(draw._prepare_operator_card_html(view, inline=True))
+        return prepared.html, requested, health, portrait
+
+    def test_operator_card_art_slot_uses_portrait_not_avatar(self):
+        # /zmd 啥子：陈千语的立绘位必须是 characterportrait，而不是头像。
+        html, requested, health, portrait = self._chen_qianyu_card(portrait_ok=True)
+        self.assertEqual(requested, [portrait])
+        art = base64.b64encode(b"art:" + portrait.encode()).decode("ascii")
+        self.assertIn(f'<img src="data:image/png;base64,{art}" alt="陈千语">', html)
+        self.assertTrue(health.complete)
+
+    def test_operator_card_portrait_miss_never_falls_back_to_avatar(self):
+        # characterportrait 原图十几 MB，超出素材预算时曾拿 charremoteicon 头像顶替，
+        # 且整卡仍算完整被缓存；现在立绘位留空，整卡标记缺图不进缓存。
+        html, requested, health, portrait = self._chen_qianyu_card(portrait_ok=False)
+        self.assertEqual(requested, [portrait])
+        self.assertNotIn('alt="陈千语"', html)
+        self.assertIn('<div class="portrait-fallback">陈</div>', html)
+        self.assertFalse(health.complete)
 
     def test_nested_weapon_info_tags_render_inner_key(self):
         draw = _load_draw()

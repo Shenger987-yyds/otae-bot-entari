@@ -115,7 +115,7 @@ def build_operator_view(raw: dict[str, Any]) -> OperatorView:
 
 def build_fz_operator_view(raw: dict[str, Any], richtext: dict[str, Any] | None = None) -> OperatorView:
     article = raw.get("article") or {}
-    attrs = _fz_template_attrs(raw)
+    attrs = _fz_operator_attrs(raw)
     hero = attrs.get("hero") if isinstance(attrs.get("hero"), dict) else {}
     skills = _build_fz_operator_skills(attrs.get("skills"))
     if not hero or not skills:
@@ -234,6 +234,51 @@ def build_fz_operator_catalog_view(
         profession_filter=profession_filter,
         source_version=str(article.get("updatedAt") or "")[:10],
     )
+
+
+# Current FZ operator pages split the card into one node per section; list
+# entries live in wikiCardItem children whose itemType is "<node>__<section>".
+_FZ_OPERATOR_CARD_SECTIONS = {
+    "endfieldCardCharacterSkills": "skills",
+    "endfieldCardCharacterTalents": "talents",
+    "endfieldCardCharacterPotentials": "potentials",
+    "endfieldCardCharacterArchive": "archive",
+}
+
+
+def _fz_operator_attrs(raw: dict[str, Any]) -> dict[str, Any]:
+    attrs = _fz_template_attrs(raw)
+    if attrs:
+        return attrs
+    content = ((raw.get("revision") or {}).get("contentJson") or {}).get("content") or []
+    result: dict[str, Any] = {}
+    for node in content:
+        if not isinstance(node, dict) or not isinstance(node.get("attrs"), dict):
+            continue
+        node_type = str(node.get("type") or "")
+        if node_type == "endfieldCardCharacterHero":
+            # The node id is the literal "hero", not a character id.
+            result["hero"] = {key: value for key, value in node["attrs"].items() if key not in {"id", "generatedBy"}}
+            continue
+        section = _FZ_OPERATOR_CARD_SECTIONS.get(node_type)
+        if not section:
+            continue
+        items: list[dict[str, Any]] = []
+        for child in node.get("content") or []:
+            child_attrs = child.get("attrs") if isinstance(child, dict) else None
+            if not isinstance(child_attrs, dict) or not isinstance(child_attrs.get("data"), dict):
+                continue
+            item_type = str(child_attrs.get("itemType") or "")
+            if item_type and item_type != f"{node_type}__{section}":
+                continue
+            items.append(child_attrs["data"])
+        result[section] = items
+    if "hero" in result:
+        # e.g. "characters:chr_0003_endminf"
+        kind, _, entity_id = _first_text(raw.get("article") or {}, "gameEntityId").partition(":")
+        if kind == "characters" and entity_id:
+            result["hero"].setdefault("charId", entity_id)
+    return result
 
 
 def _fz_species_info(attrs: dict[str, Any]) -> tuple[str, str]:

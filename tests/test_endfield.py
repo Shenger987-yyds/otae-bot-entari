@@ -1245,6 +1245,131 @@ def _sample_fz_operator():
     }
 
 
+def _sample_fz_operator_cards():
+    """Current FZ page shape (管理员·女): one node per card section, list rows in wikiCardItem."""
+    asset = "https://assets.fz.wiki/06d45acff16d38d9/glyph.png"
+
+    def card(node_type, section, *rows, **attrs):
+        return {
+            "type": node_type,
+            "attrs": {"id": section, "generatedBy": "endfield-workflow", **attrs},
+            "content": [
+                {
+                    "type": "wikiCardItem",
+                    "attrs": {
+                        "id": row_id,
+                        "data": data,
+                        "itemType": f"{node_type}__{item_section}",
+                        "generatedBy": "endfield-workflow",
+                    },
+                }
+                for row_id, item_section, data in rows
+            ],
+        }
+
+    def skill(name, type_label, group_id, desc, *rows):
+        return (
+            group_id,
+            "skills",
+            {
+                "name": name,
+                "typeLabel": type_label,
+                "groupId": group_id,
+                "description": desc,
+                "icon": {"glyph": {"url": asset}},
+                "levels": [
+                    {"level": level, "values": {"poise": 10.0 + level, "atk_scale": 0.8 + level / 20}}
+                    for level in range(1, 13)
+                ],
+                "paramTable": {"rows": list(rows)},
+                "conditions": [],
+            },
+        )
+
+    return {
+        "article": {
+            "title": "干员/管理员·女",
+            "gameEntityId": "characters:chr_0003_endminf",
+            "updatedAt": "2026-10-08T05:32:58.129Z",
+        },
+        "revision": {
+            "contentJson": {
+                "content": [
+                    {
+                        "type": "blockquote",
+                        "attrs": {"protected": True, "protectionId": "p_005caae7"},
+                        "content": [{"type": "paragraph", "content": [{"type": "text", "text": "如需查看男性管理员，请访问"}]}],
+                    },
+                    {
+                        "type": "endfieldCardCharacterHero",
+                        "attrs": {
+                            "id": "hero",
+                            "generatedBy": "endfield-workflow",
+                            "name": "管理员",
+                            "nameEn": "Endministrator",
+                            "rarity": 6,
+                            "element": "物理",
+                            "profession": "近卫",
+                            "weaponType": "单手剑",
+                            "faction": "■■",
+                            "tags": ["猛击", "控制"],
+                            "meta": [{"label": "种族", "value": "未公开"}],
+                            "iconUrl": "https://assets.fz.wiki/ed558e5d74bb2b1d/b26382a92ce4d995.png",
+                            "portraitFile": "https://assets.fz.wiki/upload/48/90/endminf.png",
+                        },
+                    },
+                    {"type": "heading", "attrs": {"id": "skills-heading", "level": 2}},
+                    card(
+                        "endfieldCardCharacterSkills",
+                        "skills",
+                        skill("毁伤序列", "普通攻击", "chr_0003_endminf_NormalAttack", "造成<@ba.pd>物理伤害</>。"),
+                        skill(
+                            "构成序列",
+                            "战技",
+                            "chr_0003_endminf_NormalSkill",
+                            "冲击前方敌人。",
+                            {"label": "技力消耗", "values": ["100"] * 12},
+                        ),
+                        skill(
+                            "锁闭序列",
+                            "连携技",
+                            "chr_0003_endminf_ComboSkill",
+                            "封印敌人。",
+                            {"label": "冷却时间", "values": ["16s"] * 11 + ["15s"]},
+                        ),
+                        skill(
+                            "轰击序列",
+                            "终结技",
+                            "chr_0003_endminf_UltimateSkill",
+                            "轰击地面。",
+                            {"label": "所需终结技能量", "values": ["80"] * 12},
+                        ),
+                        framesPage="塔卫研报/技能动作帧/管理员·女",
+                    ),
+                    card(
+                        "endfieldCardCharacterTalents",
+                        "talents",
+                        ("本质瓦解/1", "talents", {"name": "本质瓦解", "level": 1, "desc": "攻击力+{atk_up:0%}", "values": {"atk_up": 0.15}, "iconUrl": asset}),
+                        ("本质瓦解/2", "talents", {"name": "本质瓦解", "level": 2, "desc": "攻击力+{atk_up:0%}", "values": {"atk_up": 0.3}, "iconUrl": asset}),
+                        ("后勤/1", "logistics", {"name": "后勤技能", "level": 1, "desc": "后勤效果", "values": {}}),
+                    ),
+                    card(
+                        "endfieldCardCharacterPotentials",
+                        "potentials",
+                        ("1", "potentials", {"name": "最后的苏醒", "level": 1, "desc": "返还{atb_return:0}点技力。", "values": {"atb_return": 50.0}}),
+                    ),
+                    card(
+                        "endfieldCardCharacterArchive",
+                        "archive",
+                        ("基础档案", "archive", {"title": "基础档案", "body": "【代号】管理员\n【种族】■■"}),
+                        ("行动准备1", "voice", {"title": "行动准备1", "body": "行动开始。"}),
+                    ),
+                ]
+            }
+        },
+    }
+
+
 def _sample_fz_equipment():
     return {
         "article": {
@@ -3395,6 +3520,39 @@ class EndfieldServiceTests(unittest.TestCase):
         self.assertEqual(view.term_styles["ba.vup"].color, "#9eb7ff")
         self.assertEqual(view.term_styles["ba.conduct"].icon_url, "data:image/png;base64,")
 
+    def test_build_fz_operator_view_maps_section_card_schema(self):
+        # /zmd 女管 → 干员/管理员·女 used to fail with "does not match the supported card schema".
+        view = service.build_fz_operator_view(_sample_fz_operator_cards(), _sample_richtext())
+
+        self.assertEqual(view.name, "管理员")
+        self.assertEqual(view.slug, "干员/管理员·女")
+        self.assertEqual(view.operator_id, "chr_0003_endminf")
+        self.assertEqual(view.english_name, "Endministrator")
+        self.assertEqual(view.rarity, 6)
+        self.assertEqual((view.profession, view.damage_type, view.weapon_type), ("近卫", "物理", "单手剑"))
+        self.assertEqual((view.species_label, view.species), ("种族", "未公开"))
+        self.assertEqual(view.tags, ["猛击", "控制"])
+        self.assertEqual(view.source_version, "2026-10-08")
+        self.assertEqual([skill.title for skill in view.skills], ["毁伤序列", "构成序列", "锁闭序列", "轰击序列"])
+        self.assertEqual([skill.category for skill in view.skills], ["普攻", "战技", "连携技", "终结技"])
+        self.assertEqual([level.label for level in view.skills[0].levels], ["Lv9", "M1", "M2", "M3"])
+        self.assertEqual(view.skills[0].icon_id, "https://assets.fz.wiki/06d45acff16d38d9/glyph.png@raw")
+        self.assertEqual(view.skills[1].levels[-1].values["技力消耗"], "100")
+        self.assertEqual(view.skills[2].levels[-1].values["冷却"], "15s")
+        self.assertEqual(view.skills[3].levels[-1].cost, "80")
+        self.assertEqual([talent.title for talent in view.talents], ["本质瓦解"])
+        self.assertIn("30%", view.talents[0].description)
+        self.assertEqual([potential.title for potential in view.potentials], ["P1 最后的苏醒"])
+        self.assertIn("50", view.potentials[0].description)
+
+    def test_build_fz_operator_view_section_cards_without_skills_still_rejected(self):
+        raw = _sample_fz_operator_cards()
+        content = raw["revision"]["contentJson"]["content"]
+        content[:] = [node for node in content if node.get("type") != "endfieldCardCharacterSkills"]
+
+        with self.assertRaisesRegex(ValueError, "supported card schema"):
+            service.build_fz_operator_view(raw)
+
     def test_build_fz_operator_view_uses_condition_descriptions_for_multiform_skill(self):
         raw = _sample_fz_operator()
         combo = raw["revision"]["contentJson"]["content"][0]["attrs"]["skills"]["skills"][2]
@@ -3898,6 +4056,18 @@ class EndfieldSlugResolutionTests(unittest.TestCase):
         self.assertIsNotNone(view)
         self.assertEqual(view.term_styles["ba.key"].color, "#33c2ff")
         self.assertEqual(view.term_styles["ba.conduct"].icon_url, "data:image/png;base64,")
+
+    def test_fz_operator_view_builds_female_endministrator_from_section_cards(self):
+        client = _FakeWarfarinClient(
+            fz_article_data=_sample_fz_operator_cards(),
+            fz_richtext_data=_sample_richtext(),
+        )
+        svc = service.EndfieldService(client)
+        view = asyncio.run(svc.get_operator_view_from_fz("干员/管理员·女"))
+
+        self.assertIsNotNone(view)
+        self.assertEqual(view.operator_id, "chr_0003_endminf")
+        self.assertEqual(len(view.skills), 4)
 
     def test_weapon_operator_names_prefer_default_weapon_users(self):
         client = _FakeWarfarinClient(

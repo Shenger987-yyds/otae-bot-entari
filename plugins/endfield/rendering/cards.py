@@ -82,7 +82,6 @@ from ..providers.assets import (
     item_icon_urls,
     operator_icon_urls,
     operator_portrait_urls,
-    operator_round_icon_urls,
     profession_icon_urls,
     skill_icon_urls,
     sprite_png,
@@ -2159,12 +2158,9 @@ async def prepare_operator_card_html(view: OperatorView) -> PreparedCardHtml:
 
 
 async def _prepare_operator_card_html(view: OperatorView, *, inline: bool) -> PreparedCardHtml:
-    portrait_candidates = unique_urls(
-        *operator_portrait_urls(view.operator_id, view.portrait_url),
-        *operator_icon_urls(view.operator_id, view.icon_url),
-        *operator_round_icon_urls(view.operator_id, view.round_icon_url),
-    )
-    groups: dict[str, tuple[str, ...]] = {"portrait": portrait_candidates}
+    # 立绘位只收立绘：characterportrait 原图十几 MB，超出素材预算时宁可留空不缓存，
+    # 也不能拿头像顶上去再被当成完整卡片缓存。
+    groups: dict[str, tuple[str, ...]] = {"portrait": operator_portrait_urls(view.operator_id, view.portrait_url)}
     for skill in view.skills:
         groups[f"skill:{skill.skill_id}"] = skill_icon_urls(skill.icon_id, *skill.icon_fallbacks)
     for effect in view.talents:
