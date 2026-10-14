@@ -18,6 +18,7 @@ from loguru import logger
 
 from .api.mapping import dynamic_item_to_card
 from .detect import detect_dynamic, detect_live, detect_video, seen_items_of
+from .lottery_filter import applies_to
 from .models import BiliEvent, KIND_DYNAMIC, KIND_LIVE, KIND_VIDEO, SeenItem, TargetInfo
 from .store import BiliStore
 
@@ -239,7 +240,9 @@ class Poller:
             )
             return updated, events, seen_items_of(events)
         items = await self.api.dynamic_items(target.uid, deadline=self._deadline())
-        cards = [dynamic_item_to_card(item, target.uid) for item in items[:DYNAMIC_CARD_LIMIT]]
+        # 参与过滤的账号看整页：抽奖动态不该把后面的正常动态挤出前五条。
+        selected = items if applies_to(target.uid) else items[:DYNAMIC_CARD_LIMIT]
+        cards = [dynamic_item_to_card(item, target.uid) for item in selected]
         seen_ids = await self.store.seen_ids(
             KIND_DYNAMIC, target.uid, [card.item_id for card in cards if card.item_id]
         )

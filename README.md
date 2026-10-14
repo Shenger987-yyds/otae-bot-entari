@@ -11,6 +11,10 @@ End 插件的公共资料默认优先 AKEData；账号接口仍用官方，缺�
 已绑定账号可用 `/ef 探索` 或 `/zmd 探索` 查看全部地区的六类收集进度，默认查询主账号。
 命令用法、图片预览与数据边界见 [地区探索查询](docs/endfield_exploration.md)。
 
+B 站动态订阅默认跳过社交抽奖，只推送游戏资讯；可用 BILI_LOTTERY_FILTER_UIDS
+收窄到指定账号或关闭。判定依据与已知限制见
+[动态抽奖的过滤规则](docs/bilibili_endfield_lottery_filter.md)。
+
 HYW 搜索问答插件已接入：`/q 问题`、图片解释和引用追问。
 配置模型后使用，详见 [HYW 配置与用法](docs/hyw_plugin.md)。
 

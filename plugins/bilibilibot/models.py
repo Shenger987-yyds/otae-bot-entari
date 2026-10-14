@@ -109,3 +109,5 @@ class BiliCard:
     published_at: int = 0
     live_started_at: int = 0
     live_duration_seconds: int | None = None  # Estimated at the poll detecting the end.
+    # 采集时判定的抽奖原因；随队列行持久化，发送前可再次复核。
+    lottery_reason: str = ""

@@ -600,3 +600,84 @@ async def test_dynamic_tick_writes_seen_marks_and_events(bili, tmp_path):
         assert await store.outbox_count() == 1
     finally:
         await store.close()
+
+# --- official account lottery filter ----------------------------------------
+
+
+def _official_samples() -> dict[str, dict]:
+    import json
+    from pathlib import Path
+
+    fixtures = Path(__file__).parent / "fixtures/bilibili/endfield_official"
+    return {
+        name: json.loads((fixtures / f"{name}.json").read_text(encoding="utf-8"))["item"]
+        for name in ("activity", "livestream", "lottery_start", "lottery_result")
+    }
+
+
+@asyncio_test
+async def test_official_lottery_dynamics_never_reach_the_outbox(bili, tmp_path):
+    """Four verified official samples: two are queued, two are skipped."""
+    import json
+
+    uid = "1265652806"
+    samples = _official_samples()
+    items = [
+        samples[name]
+        for name in ("lottery_start", "lottery_result", "activity", "livestream")
+    ]
+    store = await open_store(bili, tmp_path)
+    try:
+        await store.upsert_target(bili.models.TargetInfo("dynamic", uid))
+        await store.add_subscription("dynamic", uid, "group", "900")
+        poller = bili.poller.Poller(
+            FakeApi(items={uid: items}), store, intervals={"dynamic": 0}
+        )
+        await poller.tick_dynamic()
+
+        rows = await store.outbox_rows()
+        titles = [json.loads(row.card_json)["title"] for row in rows]
+        assert len(rows) == 2, titles
+        assert any("趣味活动说明" in title for title in titles)
+        assert any("前瞻特别节目" in title for title in titles)
+        assert not any("抽奖" in title or "中奖" in title for title in titles)
+        # Every sample is marked as read: a restart cannot replay the filtered ones.
+        marked = await store.seen_ids(
+            "dynamic", uid, [item["id_str"] for item in items]
+        )
+        assert marked == {item["id_str"] for item in items}
+
+        await poller.tick_dynamic()
+        assert await store.outbox_count() == 2
+    finally:
+        await store.close()
+
+
+@asyncio_test
+async def test_official_page_is_not_limited_to_five_items(bili, tmp_path):
+    """Lottery posts must not push a valid post out of the five-card window."""
+    import json
+
+    uid = "1265652806"
+    samples = _official_samples()
+    items = []
+    for index in range(5):
+        clone = json.loads(json.dumps(samples["lottery_start"]))
+        clone["id_str"] = f"90000{index}"
+        items.append(clone)
+    items.append(samples["activity"])
+    store = await open_store(bili, tmp_path)
+    try:
+        await store.upsert_target(bili.models.TargetInfo("dynamic", uid))
+        await store.add_subscription("dynamic", uid, "group", "900")
+        poller = bili.poller.Poller(
+            FakeApi(items={uid: items}), store, intervals={"dynamic": 0}
+        )
+        await poller.tick_dynamic()
+
+        rows = await store.outbox_rows()
+        assert len(rows) == 1
+        assert "趣味活动说明" in json.loads(rows[0].card_json)["title"]
+    finally:
+        await store.close()
+

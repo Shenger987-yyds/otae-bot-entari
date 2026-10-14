@@ -205,7 +205,8 @@ async def handle_bili(event: Event, rest: ArgVal):
             "/bili unfollow <all|live|video|dynamic> <UID 或 room:直播间号> - 取消关注\n"
             "/bili list [all|live|video|dynamic] - 查看当前订阅列表\n"
             "/bili refresh <all|live|video|dynamic> <UID 或 room:直播间号> - 立即刷新状态\n"
-            "注：输入纯数字默认按 UID 识别；若针对直播间号请加上 room: 前缀。"
+            "注：输入纯数字默认按 UID 识别；若针对直播间号请加上 room: 前缀。\n"
+            "注：动态订阅默认跳过抽奖发起与开奖结算；用 BILI_LOTTERY_FILTER_UIDS 可收窄或关闭。"
         )
 
     action = parts[0].lower()

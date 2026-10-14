@@ -821,3 +821,110 @@ def test_real_store_expiry_drops_a_stale_live_notification(tmp_path: Path):
             await store.close()
 
     asyncio.run(scenario())
+
+# ---------------------------------------------------------------------------
+# lottery filter recheck on persisted rows
+# ---------------------------------------------------------------------------
+
+
+def test_queued_official_lottery_is_dropped_before_render_or_send():
+    """A lottery dynamic queued before the filter existed must not be sent."""
+
+    async def scenario() -> None:
+        clock = FakeClock()
+        store = FakeStore()
+        lottery = store.add(
+            _card(
+                "dynamic",
+                uid="1265652806",
+                title="互动抽奖",
+                description="恭喜中奖，已私信通知。",
+            ),
+            event_key="dynamic:1265652806:lottery",
+            subscriber_id="900",
+            kind="dynamic",
+            uid="1265652806",
+        )
+        keeper = store.add(
+            _card(
+                "dynamic",
+                uid="1265652806",
+                title="「融合！山团团！」趣味活动说明",
+                description="活动期间完成任务，可获得活动奖励。",
+            ),
+            event_key="dynamic:1265652806:activity",
+            subscriber_id="901",
+            kind="dynamic",
+            uid="1265652806",
+        )
+        recorder = Recorder()
+        notifier = _build(store, recorder, clock)
+        await notifier.start()
+        try:
+            await _wait_until(lambda: store.snapshot(keeper) is None)
+        finally:
+            await notifier.stop()
+
+        assert store.snapshot(lottery) is None, "the lottery row must be resolved"
+        assert [row_id for row_id, _ in recorder.sent] == [keeper]
+        assert recorder.renders == ["dynamic"], "the lottery card is never rendered"
+
+    asyncio.run(scenario())
+
+
+def test_other_accounts_lottery_row_is_dropped_by_default():
+    """The default scope covers every account, not just the official one."""
+
+    async def scenario() -> None:
+        clock = FakeClock()
+        store = FakeStore()
+        row = store.add(
+            _card("dynamic", uid="999", title="互动抽奖", description="恭喜中奖"),
+            event_key="dynamic:999:lottery",
+            subscriber_id="900",
+            kind="dynamic",
+            uid="999",
+        )
+        recorder = Recorder()
+        notifier = _build(store, recorder, clock)
+        await notifier.start()
+        try:
+            await _wait_until(lambda: store.snapshot(row) is None)
+        finally:
+            await notifier.stop()
+
+        assert store.snapshot(row) is None, "the lottery row must be resolved"
+        assert recorder.sent == []
+        assert recorder.renders == [], "the lottery card is never rendered"
+
+    asyncio.run(scenario())
+
+
+def test_narrowed_scope_still_delivers_other_accounts_lottery_row(monkeypatch):
+    """Explicitly narrowing the scope leaves other accounts untouched."""
+
+    async def scenario() -> None:
+        clock = FakeClock()
+        store = FakeStore()
+        row = store.add(
+            _card("dynamic", uid="999", title="互动抽奖", description="恭喜中奖"),
+            event_key="dynamic:999:lottery",
+            subscriber_id="900",
+            kind="dynamic",
+            uid="999",
+        )
+        recorder = Recorder()
+        notifier = _build(store, recorder, clock)
+        await notifier.start()
+        try:
+            await _wait_until(lambda: store.snapshot(row) is None)
+        finally:
+            await notifier.stop()
+
+        assert [row_id for row_id, _ in recorder.sent] == [row]
+
+    monkeypatch.setenv("BILI_LOTTERY_FILTER_UIDS", "1265652806")
+    asyncio.run(scenario())
+
+    asyncio.run(scenario())
+
