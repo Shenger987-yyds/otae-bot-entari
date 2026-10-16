@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .health import record_assets, record_fallback_success
 
+import asyncio
 import base64
 import html
 import hashlib
@@ -25,7 +26,7 @@ import numpy as np
 from loguru import logger
 from PIL import Image
 
-from otae_bot.infrastructure.http.asset_policy import asset_render_budget
+from otae_bot.infrastructure.http.asset_policy import asset_render_budget, asset_settings
 from otae_bot.infrastructure.http.client import fetch_many_resilient
 
 from ..cold_start import note_remote_assets, shared_image_namespaces
@@ -2160,7 +2161,8 @@ async def prepare_operator_card_html(view: OperatorView) -> PreparedCardHtml:
 async def _prepare_operator_card_html(view: OperatorView, *, inline: bool) -> PreparedCardHtml:
     # 立绘位只收立绘：characterportrait 原图十几 MB，超出素材预算时宁可留空不缓存，
     # 也不能拿头像顶上去再被当成完整卡片缓存。
-    groups: dict[str, tuple[str, ...]] = {"portrait": operator_portrait_urls(view.operator_id, view.portrait_url)}
+    portrait_urls = operator_portrait_urls(view.operator_id, view.portrait_url)
+    groups: dict[str, tuple[str, ...]] = {"portrait": portrait_urls}
     for skill in view.skills:
         groups[f"skill:{skill.skill_id}"] = skill_icon_urls(skill.icon_id, *skill.icon_fallbacks)
     for effect in view.talents:
@@ -2172,7 +2174,18 @@ async def _prepare_operator_card_html(view: OperatorView, *, inline: bool) -> Pr
             urls = term_icon_urls(style.icon_url)
             if urls:
                 groups[f"term:{term}"] = urls
-    assets, mapped, sources = await _resolve_asset_groups(groups, inline=inline)
+    # 立绘单独计时（见 PORTRAIT_RENDER_BUDGET_SECONDS），与图标并行取：图标仍按整卡预算到点，
+    # 冷缓存时整卡等立绘下完再出图，不再因为整卡预算先到而留空。
+    icon_groups = {key: urls for key, urls in groups.items() if key != "portrait"}
+    (assets, mapped, sources), (portrait_assets, portrait_mapped, portrait_sources) = await asyncio.gather(
+        _resolve_asset_groups(icon_groups, inline=inline),
+        _resolve_asset_groups(
+            {"portrait": portrait_urls}, inline=inline, budget_seconds=_portrait_render_budget()
+        ),
+    )
+    assets = _merge_prepared_assets(assets, portrait_assets)
+    mapped = {**mapped, **portrait_mapped}
+    sources = {**sources, **portrait_sources}
     portrait_source = sources.get("portrait", "")
     skill_icons = {
         skill.icon_id: mapped.get(f"skill:{skill.skill_id}", "")
@@ -3563,6 +3576,16 @@ def _centered_png_data_url(data_url: str) -> str:
 
 ASSET_RETRY_BASE_DELAY_SECONDS = 0.25
 ASSET_FETCH_MAX_BYTES = 24 * 1024 * 1024
+# characterportrait 是 2048×2048 未压缩 PNG（约 16.8 MB）。新干员（祀）在哪个命名空间都还没有
+# 磁盘副本，只能冷下载，em 上常超出整卡素材预算而留空。立绘因此单独计时、与图标并行取：
+# 连不上几秒内就报错、读停顿超过读超时也会报错，还在等的只会是正在传输的下载。
+PORTRAIT_RENDER_BUDGET_SECONDS = 60.0
+
+
+def _portrait_render_budget() -> float:
+    """立绘的素材预算：不短于整卡预算；整卡不限时（<= 0）则同样不限。"""
+    budget = asset_settings().render_budget
+    return budget if budget <= 0 else max(budget, PORTRAIT_RENDER_BUDGET_SECONDS)
 
 
 async def _prepare_assets(urls: Iterable[str], *, inline: bool) -> _PreparedAssets:
@@ -3651,12 +3674,14 @@ async def _resolve_asset_groups(
     groups: dict[str, Sequence[str]],
     *,
     inline: bool,
+    budget_seconds: float | None = None,
 ) -> tuple[_PreparedAssets, dict[str, str], dict[str, str]]:
     """先拉每组首选 URL，失败的再补拉备用源，避免目录页一次打出大量空链。
 
     首选与备用两批共用一个素材预算，备用源不会把等待时间再翻一倍。
+    ``budget_seconds`` 缺省取整卡预算；外层已有截止时间时只会收紧。
     """
-    with asset_render_budget():
+    with asset_render_budget(budget_seconds):
         return await _resolve_asset_groups_within_budget(groups, inline=inline)
 
 

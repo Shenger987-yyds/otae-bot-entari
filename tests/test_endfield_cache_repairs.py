@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import tempfile
+import time
 import unittest
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -422,6 +423,126 @@ class OperatorPortraitDiskAliasTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await endfield._render_candidate(candidate), (b"png",))
         self.assertEqual(len(htmls), 3)
         self.assertIn('alt="洛茜"', htmls[-1])
+
+
+class OperatorPortraitColdDownloadTests(unittest.IsolatedAsyncioTestCase):
+    """祀：新干员的立绘在哪个命名空间都没有副本，冷下载超出整卡素材预算后立绘位留空。"""
+
+    CARD_BUDGET = 0.2
+    PORTRAIT_BUDGET = 1.0
+
+    async def asyncSetUp(self):
+        from otae_bot.infrastructure.http import asset_policy
+        from plugins.endfield.providers.assets import (
+            operator_portrait_urls,
+            skill_icon_urls,
+        )
+        from plugins.endfield.rendering import cards
+        from plugins.endfield.rendering.cards import OperatorView, SkillView
+
+        await http.close_http_client()
+        self.directory = tempfile.TemporaryDirectory()
+        self.disk = PublicImageDiskCache(
+            Path(self.directory.name) / "images.sqlite3", 1024 * 1024
+        )
+        self.previous_settings = asset_policy._settings
+        asset_policy.configure_asset_settings(
+            asset_policy.AssetFetchSettings(render_budget=self.CARD_BUDGET)
+        )
+        self.patchers = [
+            patch.object(http, "public_images", self.disk),
+            patch.object(http, "DEADLINE_GRACE_SECONDS", 0.05),
+            patch.object(cards, "PORTRAIT_RENDER_BUDGET_SECONDS", self.PORTRAIT_BUDGET),
+        ]
+        for patcher in self.patchers:
+            patcher.start()
+        self.portrait = operator_portrait_urls("chr_0036_jsspsi")[0]
+        self.icon = skill_icon_urls("icon_skill_jsspsi_1")[0]
+        self.view = OperatorView(
+            name="祀",
+            slug="干员/祀",
+            operator_id="chr_0036_jsspsi",
+            portrait_url=self.portrait,
+            skills=[SkillView("skill_1", "普攻", icon_id="icon_skill_jsspsi_1")],
+        )
+        self.portrait_delay: float | None = 0.5  # None：一直挂着不回
+        self.served: dict[str, float] = {}
+        self.started = 0.0
+
+        async def handle(request):
+            url = str(request.url)
+            if url == self.portrait:
+                if self.portrait_delay is None:
+                    await asyncio.Event().wait()
+                await asyncio.sleep(self.portrait_delay)
+                content = b"jsspsi-portrait"
+            else:
+                content = b"skill-icon"
+            self.served[url] = time.monotonic() - self.started
+            return httpx.Response(200, content=content, headers={"content-type": "image/png"})
+
+        http._asset_client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+
+    async def asyncTearDown(self):
+        from otae_bot.infrastructure.http import asset_policy
+
+        await http.close_http_client()
+        for patcher in reversed(self.patchers):
+            patcher.stop()
+        asset_policy.configure_asset_settings(self.previous_settings)
+        self.directory.cleanup()
+
+    async def operator_card(self):
+        from plugins.endfield.rendering import cards
+        from plugins.endfield.rendering.health import track_render_health
+
+        self.started = time.monotonic()
+        with track_render_health() as health:
+            prepared = await cards._prepare_operator_card_html(self.view, inline=True)
+        return prepared, health, time.monotonic() - self.started
+
+    async def test_slow_cold_portrait_lands_after_card_budget(self):
+        prepared, health, elapsed = await self.operator_card()
+        art = base64.b64encode(b"jsspsi-portrait").decode("ascii")
+        self.assertIn(f'<img src="data:image/png;base64,{art}" alt="祀">', prepared.html)
+        icon = base64.b64encode(b"skill-icon").decode("ascii")
+        self.assertIn(f"data:image/png;base64,{icon}", prepared.html)
+        self.assertTrue(health.complete)
+        self.assertTrue(prepared.complete)
+        # 立绘晚于整卡预算才到，仍画进本次卡片；图标不用等立绘。
+        self.assertGreater(self.served[self.portrait], self.CARD_BUDGET)
+        self.assertLess(self.served[self.icon], self.CARD_BUDGET)
+        self.assertLess(elapsed, self.PORTRAIT_BUDGET)
+
+    async def test_portrait_that_never_arrives_stops_at_portrait_budget(self):
+        self.portrait_delay = None
+        prepared, health, elapsed = await self.operator_card()
+        self.assertNotIn('alt="祀"', prepared.html)
+        self.assertIn('<div class="portrait-fallback">祀</div>', prepared.html)
+        self.assertFalse(health.complete)
+        self.assertFalse(prepared.complete)
+        self.assertGreaterEqual(elapsed, self.PORTRAIT_BUDGET - 0.05)
+        self.assertLess(elapsed, self.PORTRAIT_BUDGET + 1.0)
+
+    async def test_outer_budget_still_caps_portrait(self):
+        from otae_bot.infrastructure.http.asset_policy import asset_render_budget
+
+        with asset_render_budget(self.CARD_BUDGET):
+            prepared, health, elapsed = await self.operator_card()
+        self.assertNotIn('alt="祀"', prepared.html)
+        self.assertFalse(health.complete)
+        self.assertFalse(prepared.complete)
+        self.assertLess(elapsed, self.PORTRAIT_BUDGET)
+
+    async def test_portrait_budget_never_shorter_than_card_budget(self):
+        from otae_bot.infrastructure.http import asset_policy
+        from plugins.endfield.rendering import cards
+
+        for card_budget, expected in ((0.0, 0.0), (0.2, self.PORTRAIT_BUDGET), (5.0, 5.0)):
+            asset_policy.configure_asset_settings(
+                asset_policy.AssetFetchSettings(render_budget=card_budget)
+            )
+            self.assertEqual(cards._portrait_render_budget(), expected)
 
 
 class DiskCacheTests(unittest.TestCase):
