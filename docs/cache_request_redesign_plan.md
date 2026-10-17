@@ -1,6 +1,6 @@
 # 缓存与请求体系改造方案：以查询响应延迟为主矛盾
 
-状态：第一期已在 `feat/cache-request-phase1` 落地（v1.28.0，未合并、未上线）；第二至四期未开始。基线 `main @ 19fd049`（v1.27.7）；方案原基线 `007fd6e`（v1.27.6）。
+状态：实施中·第二期（分支 `feat/cache-request-phase2`）。第一期已合入 `main @ ef3ec25`（v1.28.0）并上线沈阳云；第三、四期未开始。基线 `main @ ef3ec25`（v1.28.0）。
 
 ## 主人拍板（已定，实施须遵守）
 
@@ -28,6 +28,53 @@
 - 跨版本：19fd049 写的磁盘行，新代码断网读取 0 次网络请求（表经 `_get`，图片经分流 `mem=0 disk=2 net=0`）；`check_endfield_public_cache.py` 图片与表都是 200 → 0 次 → 304。
 - 233 个素材（232 张约 60 KB 图标 + 一张 16.8 MB 立绘，MockTransport）经 `cards._prepare_assets`：内存清空、磁盘新鲜 0.150 → 0.063 s；紧接着再取 0.077 → 0.037 s；容量淘汰 186 → 0。
 - 账号卡 `--warm-gap 90` 基准需要账号凭据与终端输入，未在本机跑；上线前在 em 跑 §5 的命令核对。
+
+## 第二期落地记录
+
+§5 第二期五项在 `feat/cache-request-phase2` 完成（v1.29.0，未推送、未上线）。`otae_bot/infrastructure/http/assets.py`
+的 `AssetBroker` 管优先级网络队列（交互 > 续传 > 预取，总并发之内按主机限流）、同 URL 去重、软 / 硬截止续传、
+预取与每日流量；`fetch_many_resilient` 只剩一层转发，签名与 `(resources, failures)` 返回形状不变，三份
+`_prepare_assets` 与 `_resolve_asset_groups` 不用改调用就走 broker。与方案 / brief 的出入：
+
+- **不新增 `soft_deadline` / `priority` 参数**：软截止仍是 `budget_seconds` / `asset_render_budget` 经
+  `batch_deadline` 换算出的时间，查询批次固定为交互优先级；调用方没有要传别的值的场景。批次的
+  mem / disk / net / net_304 / 续传数挂在返回值的 `.stats` 上（元组子类，测试替身返回裸 dict 照常兼容），
+  由 `RenderHealth` 累加进 `account-render ... net= net_304= refill=`；`_PreparedAssets` 不加字段。
+- **broker 的下载不经内存池的共享 fill**（`fetch_bytes(coalesce=False)`）：池里的 fill 被 `shield` 保护，
+  取消不到；broker 自己按 `(命名空间, 改写后 URL, 请求头指纹)` 去重，硬截止与关闭因此能真正取消下载。
+  其余 `fetch_bytes` 调用仍走池合并。原来的素材信号量删掉，所有素材请求（含 B 站卡等单独的
+  `fetch_bytes(asset=True)`）都排进同一个优先级槽位，单独调用按交互优先级。
+- **热集在 broker 里记**：每个交互批次把用到的、能落盘的公共图片（无自定义请求头）连同命名空间与
+  借用命名空间记下，不只是资料卡的 `_prepare_assets`。状态文件 `asset-hotset.json` /
+  `asset-prefetch-budget.json` 放在公共图片缓存旁（默认 `data/cache/`），不放 `data/endfield/`：
+  基础设施层不认识插件目录，测试换掉磁盘缓存时也随之隔离。
+- **不加 `_IndexRow.size`**：热集记账时就知道体积，启动预取按记下的体积从小到大、跳过 > 1 MiB 的大图。
+- **流量在收到正文时就计**（不是 job 结束时）：排队中的预取在当天额度用完后拿到槽位即放弃、不发请求，
+  最多超出一张图。304 与磁盘命中不计。预取只试一次，不重试（下次查询会再取）。
+- **账号卡预取的 URL**：`account/prefetch.py::detail_asset_urls` 与账号详情卡实际用到的图一致（头像、
+  `avatarSqUrl`、技能 / 武器 / 装备 / 战术道具图标），另加 AKE 职业 / 属性图标（干员卡在用）；
+  `avatarRtUrl` / `recordAvatarUrl` 详情卡不画，不预取。`/ef 日常` 拿到 detail 后也预取（`source=daily`）。
+- **三方互借**：`endfield-assets` / `endfield-gacha-images` / `endfield-account-ui-assets` 互借磁盘副本，
+  账号总览卡的 `_prepare_assets` 补上 `disk_aliases`。
+- **`persist_detail`** 自身改为线程里解析与写库；`_card_detail_with_snapshot` 把它丢进后台任务，Cleanup 时取消。
+- **未做 brief 的 2b（过期行 SWR）**：需主人点头，本期只让 `net_304` 可见（`HttpResource.revalidated`）。
+- **hycdn 默认并发 4 的代价**：按方案默认 `hycdn.cn=4,fz.wiki=2,warfarin.wiki=2`。只打一个主机的大批量
+  （账号卡两百多张 hycdn 图）在图床本身是瓶颈时，软截止前能拿到的张数约减半（下面模拟 112 vs 224），
+  换来慢图床不再占满全部槽位、其它主机的交互请求不排队。需要时用
+  `OTAE_HTTP_ASSET_HOST_CONCURRENCY=hycdn.cn=8,fz.wiki=2,warfarin.wiki=2` 调回。
+
+本地验证（开发机，不是 em）：
+
+- 全量 `pytest -q`：2360 passed / 2 skipped（加 changelog 条目后）；新增 `tests/test_http_asset_broker.py`
+  18 例（续传、取消不传播、硬截止、优先级与抬升、按主机并发、去重、预取不进内存、日限与跨日、
+  代理主机不预取、队列上限、热集与重启）连跑 20 次无失败；`tests/test_endfield_asset_prefetch.py` 9 例；
+  `/ef 日常` 三账号并行 < 0.6 s（串行 0.9 s）。
+- §5 复现（MockTransport，232 张 60 KB 图标都在 hycdn、每张 0.1 s、软截止 3 s）：第一次 3.01 s 返回，
+  112 张到位、120 张转续传，续传在之后 2.99 s 内全部落盘；清空内存再查 0.047 s，`disk=232 net=0`。
+  同一场景关掉按主机限流：224 张到位、8 张续传。每张 0.05 s：224 / 8，再查 0.044 s。
+- `check_endfield_public_cache.py`（图片与 `--table`）仍是 200 → 0 次 → 304。
+- em 上待核：§7.2 的日志（`net_304`、`soft_hit`、`refill done/abandoned`、`prefetch source=`）与
+  `/ef dev status` 的「素材队列」行；账号卡基准仍需凭据，未在本机跑。
 
 
 主人原话：「目前的缓存体系需要大改，请求体系也要改」「目前主要问题是各种查询的响应过慢」。
