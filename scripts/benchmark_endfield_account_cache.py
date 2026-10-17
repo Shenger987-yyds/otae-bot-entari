@@ -105,6 +105,7 @@ async def child(args, payload):
     from plugins.endfield.account.store import EndfieldRole, EndfieldStore
     from plugins.endfield.account.detail import names
     from plugins.endfield.account.investment import service as investment
+    from plugins.endfield.providers import akedata
     from otae_bot.infrastructure.http import client as shared
     from otae_bot.infrastructure.rendering.browser import (
         close_browser,
@@ -123,7 +124,12 @@ async def child(args, payload):
     public = PublicHTTP(args.mode, args.cassette)
     if args.mode == "record":
         args.cassette.mkdir(parents=True, exist_ok=True)
-    report = {"mode": args.mode, "cases": {}, "private_data_on_disk": False}
+    report = {
+        "mode": args.mode,
+        "cases": {},
+        "private_data_on_disk": False,
+        "warm_gap_seconds": args.warm_gap,
+    }
     calls = {"detail": 0, "balances": 0}
 
     async def detail(*_args):
@@ -153,6 +159,8 @@ async def child(args, payload):
                 await cache.clear()
         names._name_map_cache = None
         investment._catalog_cache = None
+        # Also forgets the in-memory manifest, so cold runs pay for it again.
+        akedata.clear_i18n_process_warm()
         await shared.clear_http_cache()
 
     try:
@@ -184,6 +192,9 @@ async def child(args, payload):
                         for _ in range(count):
                             if phase == "cold":
                                 await clear()
+                            elif args.warm_gap > 0:
+                                # Outlast short render-cache TTLs between warm queries.
+                                await asyncio.sleep(args.warm_gap)
                             before_calls = dict(calls)
                             start_calls, start_bytes = (
                                 public.calls,
@@ -309,6 +320,12 @@ def main():
         default=Path("output/endfield-performance/account-public-http"),
     )
     parser.add_argument("--runs", type=int, default=3)
+    parser.add_argument(
+        "--warm-gap",
+        type=float,
+        default=0.0,
+        help="seconds to wait before each warm run (90 checks reuse past a 60 s cache)",
+    )
     parser.add_argument("--child", action="store_true")
     parser.add_argument(
         "--mode", choices=("live", "record", "replay"), default="record"
@@ -321,6 +338,8 @@ def main():
         args.output = args.output.resolve()
     if args.baseline:
         args.baseline = args.baseline.resolve()
+    # Three account cases per child, each sleeping before every warm run.
+    child_timeout = 1500 + 3 * args.runs * max(0.0, args.warm_gap)
     sys.path.insert(0, str(args.repo))
     from loguru import logger
 
@@ -364,13 +383,15 @@ def main():
                         mode,
                         "--runs",
                         str(args.runs),
+                        "--warm-gap",
+                        str(args.warm_gap),
                         "--cassette",
                         str(args.cassette),
                     ],
                     input=json.dumps(snapshot),
                     text=True,
                     capture_output=True,
-                    timeout=1500,
+                    timeout=child_timeout,
                 )
                 if result.returncode:
                     # Never echo subprocess stderr: exceptions can contain private API data.
@@ -408,13 +429,15 @@ def main():
                     "replay",
                     "--runs",
                     str(args.runs),
+                    "--warm-gap",
+                    str(args.warm_gap),
                     "--cassette",
                     str(args.cassette),
                 ],
                 input=json.dumps(snapshot),
                 text=True,
                 capture_output=True,
-                timeout=1500,
+                timeout=child_timeout,
             )
             if result.returncode:
                 raise RuntimeError("Baseline replay failed")
@@ -435,13 +458,15 @@ def main():
                         "live",
                         "--runs",
                         str(args.runs),
+                        "--warm-gap",
+                        str(args.warm_gap),
                         "--cassette",
                         str(args.cassette),
                     ],
                     input=json.dumps(snapshot),
                     text=True,
                     capture_output=True,
-                    timeout=1500,
+                    timeout=child_timeout,
                 )
                 if result.returncode:
                     raise RuntimeError("Live account benchmark failed")

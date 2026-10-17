@@ -150,19 +150,21 @@
 
 这项探针只用于确认行为，运行时也有回归测试负载，不以其单次耗时计算性能百分比。自动化另测 no-store/private、隐式 Cookie/Auth、原截止时间不续期、坏哈希删除、容量淘汰和清理期间旧请求不可回填。
 
-默认设置（MiB）：
+默认设置（MiB；缓存与请求体系改造第一期后的值，见 [cache_request_redesign_plan.md](cache_request_redesign_plan.md)）：
 
 | 配置 | 默认 | 作用 |
 | --- | ---: | --- |
 | `OTAE_HTTP_API_CACHE_MIB` | 8 | API 原文与解析结果 |
-| `OTAE_HTTP_TABLE_CACHE_MIB` | 64 | AKEData 表原文与解析结果 |
-| `OTAE_HTTP_ASSET_CACHE_MIB` | 24 | HTTP 图片字节 |
+| `OTAE_HTTP_TABLE_CACHE_MIB` | 64 | AKEData 表原文与解析结果（I18nTextTable_CN 除外） |
+| `OTAE_HTTP_I18N_CACHE_MIB` | 64 | 当前版本 I18nTextTable_CN 的常驻槽，只放一条（实际约 45 MiB） |
+| `OTAE_HTTP_ASSET_CACHE_MIB` | 64 | HTTP 图片字节（小图池；第一期前为 24） |
+| `OTAE_HTTP_ASSET_LARGE_ENTRY_KIB` | 1024 | 超过它且磁盘有副本的图（立绘、横幅）不进内存池，命中时直接读磁盘 |
 | `OTAE_PUBLIC_IMAGE_CACHE_MIB` | 256 | 磁盘公共图片内容；设 0 可关闭 |
 | `OTAE_PUBLIC_IMAGE_CACHE_PATH` | `data/cache/public-images-v1.sqlite3` | 可丢弃的公共图片缓存位置 |
 
 素材请求的超时、重试、按主机熔断、整卡截止时间与可选代理见 [http_asset_lane.md](http_asset_lane.md)（`OTAE_HTTP_ASSET_*`）。
 
-内存三池总预算 96 MiB，不包括其他业务/PNG 缓存、仍被派生对象引用的源树、在途响应、Python 分配器与浏览器。磁盘 256 MiB 限制的是图片内容，SQLite 索引/WAL 有额外开销。旧抽卡图片目录暂未整体迁移到这个磁盘预算：本轮增加了 TTL、清理标记和派生图源时间检查，但**不能宣称所有历史缓存文件已统一限容**。
+内存四池预算上限合计 200 MiB（常驻约 8 + 64 + 45 + 64 ≈ 180 MiB），不包括其他业务/PNG 缓存、仍被派生对象引用的源树、在途响应、Python 分配器与浏览器；第一期前是三池 96 MiB。成品图缓存（账号页、挑战页、配装、资料卡）TTL 为 30 分钟。磁盘 256 MiB 限制的是图片内容，SQLite 索引/WAL 有额外开销；每行的元数据（不含正文）另在进程内存里有一份索引，4096 行约 1 MiB。旧抽卡图片目录暂未整体迁移到这个磁盘预算：本轮增加了 TTL、清理标记和派生图源时间检查，但**不能宣称所有历史缓存文件已统一限容**。
 
 磁盘白名单只接受指定公共 HTTPS 图片路径，拒绝带查询参数/认证头和私人 API；保存哈希键、图片和公共验证器，不保存请求 URL、账号标识、Token、Cookie、档案 JSON 或私人 PNG。官方个人数据只用于当前内存查询；程序自身已有加密账号存储机制未改动。
 
