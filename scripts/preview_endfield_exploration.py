@@ -8,6 +8,7 @@ import importlib
 import json
 import sys
 import types
+from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
 
@@ -21,8 +22,15 @@ service = importlib.import_module(f"{PACKAGE}.account.exploration.service")
 draw = importlib.import_module(f"{PACKAGE}.account.exploration.draw")
 version = importlib.import_module(f"{PACKAGE}.account.exploration.version")
 
-from otae_bot.infrastructure.rendering.browser import _launch_browser, close_browser
+from otae_bot.infrastructure.rendering.browser import _launch_candidates, close_browser
 from otae_bot.infrastructure.rendering.executor import close_image_executor
+
+
+def _launch(playwright):
+    for kwargs in _launch_candidates(None):
+        with suppress(Exception):
+            return playwright.chromium.launch(**kwargs)
+    raise RuntimeError("No browser found. Install Chrome/Edge or run: playwright install chromium")
 
 
 def inspect_layout(paths: list[Path]) -> list[dict]:
@@ -30,7 +38,7 @@ def inspect_layout(paths: list[Path]) -> list[dict]:
 
     reports = []
     with sync_playwright() as playwright:
-        browser = _launch_browser(playwright, None)
+        browser = _launch(playwright)
         try:
             for path in paths:
                 page = browser.new_page(

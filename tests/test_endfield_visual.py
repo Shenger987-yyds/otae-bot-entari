@@ -413,6 +413,35 @@ class EndfieldVisualRegressionTests(unittest.IsolatedAsyncioTestCase):
             image = Image.open(io.BytesIO(content))
             self.assertEqual(image.size, (120, 80))
 
+    async def test_parallel_renders_keep_their_own_scale_factor(self):
+        from otae_bot.infrastructure.rendering.browser import browser_queue_snapshot
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "scale.html"
+            path.write_text(
+                '<style>html,body{margin:0}.card{width:120px;height:80px;background:#286cd6}</style>'
+                '<div class="card"></div>',
+                encoding="utf-8",
+            )
+            scales = (1.0, 2.0, 1.25, 2.0)
+            shots = await asyncio.gather(
+                *(
+                    screenshot_web_element(
+                        path.resolve().as_uri(),
+                        ".card",
+                        viewport=(120, 80),
+                        settle_ms=0,
+                        device_scale_factor=scale,
+                    )
+                    for scale in scales
+                )
+            )
+        sizes = [Image.open(io.BytesIO(shot)).size for shot in shots]
+        self.assertEqual(sizes, [(round(120 * scale), round(80 * scale)) for scale in scales])
+        snapshot = browser_queue_snapshot()
+        self.assertEqual(snapshot["inflight"], 0)
+        self.assertLessEqual(snapshot["contexts"], snapshot["concurrency"])
+
 
 if __name__ == "__main__":
     unittest.main()

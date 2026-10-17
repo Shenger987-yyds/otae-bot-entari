@@ -1,38 +1,29 @@
-"""浏览器线程排队计时：只换掉同步截图函数，不启动 Chromium。"""
+"""渲染槽位排队计时：只换掉页面上的截图工作，不启动 Chromium。"""
 
 from __future__ import annotations
 
 import asyncio
-import time
 import unittest
-from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 from otae_bot.infrastructure.rendering import browser
+from tests.support.browser import FakeBrowserHarness
+
+
+async def slow_screenshot(*_args):
+    await asyncio.sleep(0.2)
+    return b"png"
+
+
+async def quick_evaluate(*_args):
+    return {"ok": True}
 
 
 class ScreenshotQueueTimingTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fake-playwright")
-        self.addCleanup(self.executor.shutdown, wait=True)
-        patcher = patch.object(browser, "_get_browser_executor", return_value=self.executor)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
-        def slow_screenshot(*_args):
-            time.sleep(0.2)
-            return b"png"
-
-        def quick_evaluate(*_args):
-            return {"ok": True}
-
-        for name, fake in (
-            ("_screenshot_web_element_sync", slow_screenshot),
-            ("_evaluate_web_page_sync", quick_evaluate),
-        ):
-            patcher = patch.object(browser, name, fake)
-            patcher.start()
-            self.addCleanup(patcher.stop)
+        await FakeBrowserHarness(
+            self, concurrency=1, screenshot=slow_screenshot, evaluate=quick_evaluate
+        ).start()
 
     async def test_queue_wait_grows_behind_an_earlier_screenshot(self):
         async def timed_call(delay: float):

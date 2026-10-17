@@ -8,6 +8,7 @@ import json
 import asyncio
 import logging
 import tarfile
+import threading
 import time
 import types
 import sqlite3
@@ -2969,36 +2970,34 @@ remotePort = {{ $v.Second }}
                     )
             self.assertEqual((Path(tmp) / "wiki.png").read_bytes(), b"png-data")
 
-    def test_image_utils_uses_dedicated_browser_executor(self):
+    def test_image_utils_uses_dedicated_browser_thread(self):
         import otae_bot.infrastructure.rendering.browser as image_utils
+        from tests.support.browser import FakeBrowserHarness
 
-        class FakeLoop:
-            def __init__(self):
-                self.executor = None
-                self.args = None
+        threads = []
 
-            async def run_in_executor(self, executor, func, *args):
-                self.executor = executor
-                self.args = args
-                return func(*args)
-
-        def fake_sync(*args):
+        async def fake_screenshot(page, context, web_url, *args):
+            threads.append(threading.current_thread().name)
             return b"png-data"
 
-        async def run_case():
-            await image_utils.close_browser()
-            loop = FakeLoop()
-            with patch("asyncio.get_running_loop", return_value=loop):
-                with patch.object(image_utils, "_screenshot_web_element_sync", fake_sync):
-                    result = await image_utils.screenshot_web_element("https://example.com")
-            executor = loop.executor
-            self.assertEqual(result, b"png-data")
-            self.assertIsNotNone(executor)
-            await image_utils.close_browser()
-            return executor
+        harness = FakeBrowserHarness(self, screenshot=fake_screenshot)
 
-        executor = asyncio.run(run_case())
-        self.assertTrue(executor._shutdown)
+        async def run_case():
+            await harness.start()
+            result = await image_utils.screenshot_web_element("https://example.com")
+            host = image_utils._host
+            await image_utils.close_browser()
+            return result, host
+
+        result, host = asyncio.run(run_case())
+        self.assertEqual(result, b"png-data")
+        self.assertEqual(threads, ["playwright"])
+        self.assertIsNone(image_utils._host)
+        self.assertFalse(host.thread.is_alive())
+        # A later render from a new loop starts a new browser thread.
+        self.assertEqual(asyncio.run(image_utils.screenshot_web_element("https://example.com")), b"png-data")
+        self.assertEqual(len(harness.browsers), 2)
+        asyncio.run(image_utils.close_browser())
 
     def test_image_utils_prefers_playwright_bundled_chromium(self):
         import otae_bot.infrastructure.rendering.browser as image_utils
@@ -3006,13 +3005,16 @@ remotePort = {{ $v.Second }}
         calls = []
 
         class FakeChromium:
-            def launch(self, **kwargs):
+            async def launch(self, **kwargs):
                 calls.append(kwargs)
                 return "browser"
 
         playwright = types.SimpleNamespace(chromium=FakeChromium())
-        self.assertEqual(image_utils._launch_browser(playwright, None), "browser")
+        self.assertEqual(asyncio.run(image_utils._launch_browser(playwright, None)), "browser")
         self.assertEqual(calls, [{"headless": True}])
+        proxied = image_utils._launch_candidates({"server": "http://p:1"})
+        self.assertEqual([kwargs.get("channel") for kwargs in proxied], [None, "chrome", "msedge"])
+        self.assertTrue(all(kwargs["proxy"] == {"server": "http://p:1"} for kwargs in proxied))
 
     def test_minecraft_data_manager_crud_and_rank(self):
         data_source = _load_module("minecraft_data_source_for_test", "plugins/minecraft_plugin/data_source.py")
