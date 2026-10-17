@@ -52,7 +52,11 @@ from otae_bot.adapters.message_log import sensitive_input
 from otae_bot.adapters.onebot import send_forward_images
 from otae_bot.infrastructure.rendering.help_runtime import cached_help_image
 from otae_bot.infrastructure.http.asset_policy import asset_render_budget
-from otae_bot.infrastructure.http.client import clear_http_cache, get_http_cache_stats
+from otae_bot.infrastructure.http.client import (
+    clear_http_cache,
+    get_http_cache_diagnostics,
+    get_http_cache_stats,
+)
 from otae_bot.infrastructure.rendering.temp_files import schedule_temp_file_cleanup
 
 from .providers.warfarin import WarfarinAPIError, WarfarinClient
@@ -262,7 +266,11 @@ GACHA_FALLBACK_BATCH = 3                # 合并转发不可用时，每条消�
 GACHA_FORWARD_TIMEOUT_SECONDS = 60.0    # OneBot 回退（多页大图）的 HTTP 超时
 FORWARD_MAX_NODES = 50                  # 单条合并转发的节点上限，超出拆成多条
 _GACHA_FORWARD_SENDER_NAME = "终末地抽卡分析"
-CARD_CACHE_TTL_SECONDS = 600.0
+# 成品图缓存（资料卡、配装、账号页、挑战页）。key 已含视图内容 digest、渲染版本
+# （账号页 / 挑战页还含素材代次），内容一变 key 就变；TTL 只决定同一结果能复用多久。
+# 素材代次变化或 /ef dev clear 时整体失效。个人原始数据不在这里缓存。
+RENDER_CACHE_TTL_SECONDS = 30 * 60.0
+CARD_CACHE_TTL_SECONDS = RENDER_CACHE_TTL_SECONDS
 CARD_CACHE_MAX_BYTES = 48 * 1024 * 1024
 CARD_RENDER_VERSION = "endfield-card-v55"
 CardCacheKey = tuple[str, str, str, str, str, str, str]
@@ -274,10 +282,10 @@ _CARD_CACHE: AsyncTTLCache[CardCacheKey, tuple[bytes, ...]] = AsyncTTLCache(
     sizeof=lambda pages: sum(len(page) for page in pages),
 )
 _LOADOUT_CACHE: AsyncTTLCache[tuple[str, str], bytes] = AsyncTTLCache(
-    ttl_seconds=60.0, max_bytes=24 * 1024 * 1024, max_entries=32, sizeof=len,
+    ttl_seconds=RENDER_CACHE_TTL_SECONDS, max_bytes=24 * 1024 * 1024, max_entries=32, sizeof=len,
 )
 _ACCOUNT_PAGE_CACHE: AsyncTTLCache[tuple[str, ...], tuple[bytes, ...]] = AsyncTTLCache(
-    ttl_seconds=60.0, max_bytes=32 * 1024 * 1024, max_entries=24,
+    ttl_seconds=RENDER_CACHE_TTL_SECONDS, max_bytes=32 * 1024 * 1024, max_entries=24,
     sizeof=lambda pages: sum(map(len, pages)),
 )
 _ASSET_GENERATION = 0
@@ -287,6 +295,7 @@ _CALENDAR_CACHE: AsyncTTLCache[str, bytes] = AsyncTTLCache(
     max_entries=4,
     sizeof=len,
 )
+# 挑战的原始个人 API 数据只复用 60 秒；渲染结果按成品图 TTL。
 CHALLENGE_CACHE_TTL_SECONDS = 60.0
 ChallengeCacheKey = tuple
 _CHALLENGE_DATA_CACHE: AsyncTTLCache[tuple[str, str, str], dict] = AsyncTTLCache(
@@ -296,7 +305,7 @@ _CHALLENGE_DATA_CACHE: AsyncTTLCache[tuple[str, str, str], dict] = AsyncTTLCache
     sizeof=lambda payload: len(json.dumps(payload, ensure_ascii=False, separators=(",", ":"))),
 )
 _CHALLENGE_RENDER_CACHE: AsyncTTLCache[ChallengeCacheKey, tuple[bytes, ...]] = AsyncTTLCache(
-    ttl_seconds=CHALLENGE_CACHE_TTL_SECONDS,
+    ttl_seconds=RENDER_CACHE_TTL_SECONDS,
     max_bytes=48 * 1024 * 1024,
     max_entries=64,
     sizeof=lambda pages: sum(len(page) for page in pages),
@@ -1704,6 +1713,7 @@ async def _render_account_detail(
                 logger.warning(f"[endfield] account AKE name map unavailable: {exc}")
                 return None
 
+        data_started = perf_counter()
         detail, currency_balances, name_map = await asyncio.gather(
             _card_detail_with_snapshot(token, role),
             load_currency_balances(),
@@ -1726,7 +1736,10 @@ async def _render_account_detail(
                 view = replace(view, main_mission=locale.text(view.main_mission))
             except Exception as exc:
                 logger.warning("[endfield] account mission localization unavailable ({})", type(exc).__name__)
-        pages = await _render_account_pages("detail", role, group, view, lambda: draw_account_detail_cards(view))
+        pages = await _render_account_pages(
+            "detail", role, group, view, lambda: draw_account_detail_cards(view),
+            data_seconds=perf_counter() - data_started,
+        )
         return await _finish_pngs(matcher, pages)
 
 
@@ -1786,6 +1799,7 @@ async def _render_account_investment(
                 logger.warning(f"[endfield] investment AKE name map unavailable: {exc}")
                 return None
 
+        data_started = perf_counter()
         detail, catalog, name_map = await asyncio.gather(
             _card_detail_with_snapshot(token, role),
             fetch_account_investment_catalog(),
@@ -1799,7 +1813,10 @@ async def _render_account_investment(
             catalog=catalog,
             name_map=name_map,
         )
-        pages = await _render_account_pages("investment", role, group, view, lambda: draw_account_investment_cards(view))
+        pages = await _render_account_pages(
+            "investment", role, group, view, lambda: draw_account_investment_cards(view),
+            data_seconds=perf_counter() - data_started,
+        )
         return await _finish_pngs(matcher, pages)
 
 
@@ -1993,6 +2010,7 @@ async def _render_account_base(
                 logger.warning(f"[endfield] account AKE name map unavailable: {exc}")
                 return None
 
+        data_started = perf_counter()
         detail, name_map = await asyncio.gather(
             _card_detail_with_snapshot(token, role),
             load_name_map(),
@@ -2007,10 +2025,15 @@ async def _render_account_base(
             store=account_store,
             name_map=name_map,
         )
+        data_seconds = perf_counter() - data_started
+
         async def render():
             return (await draw_account_base_card(view),)
 
-        return await _finish_pngs(matcher, await _render_account_pages("base", role, group, view, render))
+        return await _finish_pngs(
+            matcher,
+            await _render_account_pages("base", role, group, view, render, data_seconds=data_seconds),
+        )
 
 
 async def _handle_exploration(
@@ -2025,6 +2048,7 @@ async def _handle_exploration(
     with cold_start_command(matcher):
         token = account_store.decrypt_token(role, cipher)
         # A cold version lookup can take a while; overlap it with the account fetch.
+        data_started = perf_counter()
         detail, game_version = await asyncio.gather(
             _card_detail_with_snapshot(token, role), fetch_exploration_version()
         )
@@ -2035,12 +2059,16 @@ async def _handle_exploration(
             server_name=role.server_name or role.server_id,
             version=game_version,
         )
+        data_seconds = perf_counter() - data_started
 
         async def render():
             return await draw_exploration_cards(view)
 
         return await _finish_pngs(
-            matcher, await _render_account_pages("exploration", role, group, view, render)
+            matcher,
+            await _render_account_pages(
+                "exploration", role, group, view, render, data_seconds=data_seconds
+            ),
         )
 
 
@@ -2050,9 +2078,13 @@ class _IncompletePages(Exception):
 
 
 async def _render_account_pages(
-    kind: str, role, group: bool, view, render
+    kind: str, role, group: bool, view, render, *, data_seconds: float = 0.0
 ) -> tuple[bytes, ...]:
-    """Cache only rendering after current data and authorization were resolved."""
+    """Cache only rendering after current data and authorization were resolved.
+
+    ``data_seconds`` is the caller's API/table time, logged next to the asset
+    and drawing time of this render.
+    """
     digest = hashlib.sha256(
         json.dumps(
             asdict(view),
@@ -2071,10 +2103,16 @@ async def _render_account_pages(
         digest,
     )
 
+    asset_seconds = 0.0
+
     async def create_pages():
+        nonlocal asset_seconds
         # 整张卡共用一个素材预算；到点未取到的素材留空，页面照常出图（不进缓存）。
         with track_render_health() as health, asset_render_budget():
-            pages = tuple(await render())
+            try:
+                pages = tuple(await render())
+            finally:
+                asset_seconds = health.asset_seconds
             if not health.complete:
                 raise _IncompletePages(pages)
             return pages
@@ -2086,9 +2124,11 @@ async def _render_account_pages(
         )
     except _IncompletePages as exc:
         pages, hit = exc.pages, False
+    seconds = perf_counter() - started
     logger.info(
-        f"[endfield] account-render kind={kind} reuse={hit} "
-        f"seconds={perf_counter() - started:.3f} pages={len(pages)}"
+        f"[endfield] account-render kind={kind} reuse={hit} data={data_seconds:.3f} "
+        f"assets={asset_seconds:.3f} draw={max(0.0, seconds - asset_seconds):.3f} "
+        f"seconds={seconds:.3f} pages={len(pages)}"
     )
     return pages
 
@@ -3734,6 +3774,7 @@ async def _cache_status_lines() -> list[str]:
     card_stats = await _CARD_CACHE.stats()
     loadout_stats = await _LOADOUT_CACHE.stats()
     account_stats = await _ACCOUNT_PAGE_CACHE.stats()
+    diagnostics = await get_http_cache_diagnostics()
     return [
         _format_cache_stats("API", api_stats),
         _format_cache_stats("AKEData", table_stats),
@@ -3741,7 +3782,8 @@ async def _cache_status_lines() -> list[str]:
         _format_cache_stats("成品卡片", card_stats),
         _format_cache_stats("配装卡片", loadout_stats),
         _format_cache_stats("账号卡片", account_stats),
-        f"缓存策略: TTL {int(CARD_CACHE_TTL_SECONDS)}s / 下载并发 8",
+        _format_memory_pools(diagnostics),
+        f"缓存策略: 成品图 TTL {int(RENDER_CACHE_TTL_SECONDS)}s / 下载并发 8",
     ]
 
 
@@ -3749,7 +3791,24 @@ def _format_cache_stats(label: str, stats: CacheStats) -> str:
     return (
         f"{label}: {stats.entries} 项 / {stats.bytes / 1024 / 1024:.1f} MiB / "
         f"直接命中 {stats.direct_hits} / 未命中 {stats.misses} / 等待合并 {stats.coalesced} / "
-        f"过期 {stats.expirations} / 容量淘汰 {stats.capacity_evictions}"
+        f"过期 {stats.expirations} / 容量淘汰 {stats.capacity_evictions} / 超限 {stats.oversized}"
+    )
+
+
+def _format_memory_pools(diagnostics: dict) -> str:
+    """Pool fill for small images and the I18n slot; large images are served from disk."""
+    pools = diagnostics["pools"]
+    counters = [
+        values for namespace, values in diagnostics["namespaces"].items()
+        if namespace.startswith("endfield-")
+    ]
+    large_hits = int(sum(values.get("large_disk_hits", 0) for values in counters))
+    bypassed = int(sum(values.get("bypassed", 0) for values in counters))
+    mib = 1024 * 1024
+    return (
+        f"素材池: 小图 {pools['assets']['bytes'] / mib:.1f}/{pools['assets']['budget_bytes'] / mib:.0f} MiB · "
+        f"I18n 常驻 {pools['i18n']['bytes'] / mib:.1f} MiB · "
+        f"大图直通命中 {large_hits} · 直通跳过 {bypassed}"
     )
 
 

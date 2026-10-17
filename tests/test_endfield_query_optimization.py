@@ -381,6 +381,9 @@ class LoadoutCacheTests(unittest.IsolatedAsyncioTestCase):
             await endfield._render_loadout_view(loadout_view())
             now[0] += 61
             await endfield._render_loadout_view(loadout_view())
+            self.assertEqual(renderer.await_count, 1)  # the content-keyed PNG outlives a minute
+            now[0] += endfield.RENDER_CACHE_TTL_SECONDS
+            await endfield._render_loadout_view(loadout_view())
         self.assertEqual(renderer.await_count, 2)
         self.assertEqual(endfield._LOADOUT_CACHE.max_entries, 32)
         self.assertEqual(endfield._LOADOUT_CACHE.max_bytes, 24 * 1024 * 1024)

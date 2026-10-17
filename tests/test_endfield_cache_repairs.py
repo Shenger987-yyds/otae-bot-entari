@@ -20,7 +20,11 @@ from otae_bot.infrastructure.http.disk import (
     public_image_request,
 )
 from plugins.endfield import handlers as endfield
-from plugins.endfield.rendering.health import record_assets, record_fallback_success
+from plugins.endfield.rendering.health import (
+    record_asset_seconds,
+    record_assets,
+    record_fallback_success,
+)
 
 
 class HttpCacheRepairTests(unittest.IsolatedAsyncioTestCase):
@@ -665,6 +669,49 @@ class AccountPageCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             (detail.await_count, balance.await_count, draw.await_count), (2, 2, 1)
         )
+
+    async def test_rendered_pages_are_reused_for_thirty_minutes(self):
+        self.assertEqual(endfield._ACCOUNT_PAGE_CACHE.ttl_seconds, 30 * 60)
+        for cache in (endfield._CARD_CACHE, endfield._LOADOUT_CACHE, endfield._CHALLENGE_RENDER_CACHE):
+            self.assertEqual(cache.ttl_seconds, endfield.RENDER_CACHE_TTL_SECONDS)
+        # Raw personal API data keeps its short window.
+        self.assertEqual(endfield._CHALLENGE_DATA_CACHE.ttl_seconds, 60)
+
+    async def test_render_log_splits_data_assets_and_drawing(self):
+        async def render():
+            record_asset_seconds(0.25)
+            return (b"png",)
+
+        with patch.object(endfield, "logger") as log:
+            await endfield._render_account_pages(
+                "detail", self.role, True, PageView(), render, data_seconds=1.5
+            )
+            await endfield._render_account_pages(
+                "detail", self.role, True, PageView(), render, data_seconds=0.5
+            )
+        first, second = (call.args[0] for call in log.info.call_args_list)
+        self.assertIn("reuse=False data=1.500 assets=0.250 draw=", first)
+        self.assertIn("reuse=True data=0.500 assets=0.000 draw=", second)
+
+
+class CacheStatusTests(unittest.IsolatedAsyncioTestCase):
+    async def test_status_shows_pools_large_image_counters_and_oversized(self):
+        diagnostics = {
+            "pools": {
+                "assets": {"bytes": 3 * 1024 * 1024, "budget_bytes": 64 * 1024 * 1024},
+                "i18n": {"bytes": 45 * 1024 * 1024, "budget_bytes": 64 * 1024 * 1024},
+            },
+            "namespaces": {
+                "endfield-assets": {"large_disk_hits": 2, "bypassed": 3},
+                "endfield-gacha-images": {"large_disk_hits": 1},
+                "other": {"large_disk_hits": 100},
+            },
+        }
+        with patch.object(endfield, "get_http_cache_diagnostics", AsyncMock(return_value=diagnostics)):
+            lines = await endfield._cache_status_lines()
+        self.assertIn("素材池: 小图 3.0/64 MiB · I18n 常驻 45.0 MiB · 大图直通命中 3 · 直通跳过 3", lines)
+        self.assertTrue(all("超限" in line for line in lines[:6]))
+        self.assertEqual(lines[-1], "缓存策略: 成品图 TTL 1800s / 下载并发 8")
 
 
 class MedalPaginationRepairTests(unittest.IsolatedAsyncioTestCase):

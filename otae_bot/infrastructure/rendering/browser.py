@@ -1,15 +1,20 @@
 """Reusable browser process, resource loading and HTML screenshots."""
 
-from typing import Any, Literal
+from typing import Any, Callable, Iterator, Literal, TypeVar
 from otae_bot.config.paths import TEMP_PATH
 from otae_bot.config.settings import SYSTEM_PROXY
 import base64
 from pathlib import Path
 import asyncio
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from collections.abc import Mapping, Sequence
+
+from loguru import logger
 
 
 _playwright_manager = None
@@ -17,12 +22,64 @@ _browser = None
 _browser_lock = threading.Lock()
 _browser_executor = None
 _browser_executor_lock = threading.Lock()
+# 一次截图在浏览器线程前排队超过这么久就记一条告警（单线程是跨用户的串行点）。
+QUEUE_WAIT_WARNING_SECONDS = 1.0
+_T = TypeVar("_T")
 
 
 @dataclass(frozen=True, slots=True)
 class BrowserResource:
     content: bytes
     content_type: str = "application/octet-stream"
+
+
+@dataclass(slots=True)
+class ScreenshotTiming:
+    """Browser-thread time of the screenshots and evaluations in one scope."""
+
+    queue_wait: float = 0.0  # waiting for the single browser thread
+    run: float = 0.0  # on the browser thread
+    calls: int = 0
+
+
+_timing: ContextVar[ScreenshotTiming | None] = ContextVar("browser_screenshot_timing", default=None)
+
+
+@contextmanager
+def screenshot_timing() -> Iterator[ScreenshotTiming]:
+    """Collect queue wait and run time of browser calls made inside this block."""
+    timing = ScreenshotTiming()
+    token = _timing.set(timing)
+    try:
+        yield timing
+    finally:
+        _timing.reset(token)
+
+
+async def _run_on_browser_thread(function: Callable[..., _T], *args) -> _T:
+    loop = asyncio.get_running_loop()
+    queued = time.perf_counter()
+    marks: list[float] = []
+
+    def timed():
+        marks.append(time.perf_counter())
+        try:
+            return function(*args)
+        finally:
+            marks.append(time.perf_counter())
+
+    try:
+        return await loop.run_in_executor(_get_browser_executor(), timed)
+    finally:
+        if marks:
+            waited = marks[0] - queued
+            timing = _timing.get()
+            if timing is not None:
+                timing.queue_wait += waited
+                timing.run += (marks[1] if len(marks) > 1 else time.perf_counter()) - marks[0]
+                timing.calls += 1
+            if waited > QUEUE_WAIT_WARNING_SECONDS:
+                logger.warning(f"[browser] queue_wait={waited:.3f}s before {function.__name__}")
 
 
 def _playwright_proxy_conf():
@@ -101,9 +158,7 @@ async def screenshot_web_element(
     screenshot_backend: Literal["playwright", "cdp"] = "playwright",
 ) -> bytes:
     """Screenshot a single page element using a reusable browser."""
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        _get_browser_executor(),
+    return await _run_on_browser_thread(
         _screenshot_web_element_sync,
         web_url,
         selector,
@@ -270,9 +325,7 @@ async def evaluate_web_page(
     Playwright thread with :func:`screenshot_web_element` and applies the same
     request routing, so measured sizes match what a screenshot would see.
     """
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        _get_browser_executor(),
+    return await _run_on_browser_thread(
         _evaluate_web_page_sync,
         web_url,
         script,

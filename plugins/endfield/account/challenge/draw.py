@@ -26,7 +26,7 @@ async def _noted_challenge_assets(urls, *, inline: bool = False):
     await note_remote_assets(urls, namespace=REMOTE_ASSET_NAMESPACE)
     return await _prepare_assets(urls, inline=inline)
 from otae_bot.infrastructure.rendering.executor import run_image_render
-from otae_bot.infrastructure.rendering.browser import screenshot_web_element
+from otae_bot.infrastructure.rendering.browser import screenshot_timing, screenshot_web_element
 from otae_bot.infrastructure.rendering.temp_files import schedule_temp_file_cleanup
 
 
@@ -369,25 +369,26 @@ async def _render_challenge(
     try:
         screenshot_started = perf_counter()
         try:
-            output = await screenshot_web_element(
-                html_path.resolve().as_uri(),
-                ".challenge-card",
-                viewport=(CHALLENGE_CARD_WIDTH, CHALLENGE_CARD_HEIGHT),
-                timeout_ms=25000,
-                # 高度不封顶：内容多了就往下长。这里只留一个失控兜底值。
-                max_height=CHALLENGE_CARD_MAX_HEIGHT,
-                device_scale_factor=1.0,
-                settle_ms=60,
-                resources=resources,
-                wait_for_images=True,
-                wait_for_fonts=True,
-                resource_wait_timeout_ms=5000,
-                screenshot_timeout_ms=60000,
-                # Playwright 的 page.screenshot 会再次无界等待 document.fonts.ready；
-                # 挑战页先做有界等待，再直接使用 Chromium 截图，避免字体状态卡死。
-                screenshot_backend="cdp",
-                strict_max_height=True,
-            )
+            with screenshot_timing() as timing:
+                output = await screenshot_web_element(
+                    html_path.resolve().as_uri(),
+                    ".challenge-card",
+                    viewport=(CHALLENGE_CARD_WIDTH, CHALLENGE_CARD_HEIGHT),
+                    timeout_ms=25000,
+                    # 高度不封顶：内容多了就往下长。这里只留一个失控兜底值。
+                    max_height=CHALLENGE_CARD_MAX_HEIGHT,
+                    device_scale_factor=1.0,
+                    settle_ms=60,
+                    resources=resources,
+                    wait_for_images=True,
+                    wait_for_fonts=True,
+                    resource_wait_timeout_ms=5000,
+                    screenshot_timeout_ms=60000,
+                    # Playwright 的 page.screenshot 会再次无界等待 document.fonts.ready；
+                    # 挑战页先做有界等待，再直接使用 Chromium 截图，避免字体状态卡死。
+                    screenshot_backend="cdp",
+                    strict_max_height=True,
+                )
         except Exception as exc:
             logger.opt(exception=exc).error(
                 "[endfield-challenge] render failed "
@@ -408,6 +409,7 @@ async def _render_challenge(
         logger.info(
             "[endfield-challenge] render complete "
             f"kind={kind} page={page}/{page_count} resources={len(resources)} "
+            f"queue_wait={timing.queue_wait:.3f}s "
             f"screenshot={optimize_started - screenshot_started:.3f}s "
             f"png_optimize={perf_counter() - optimize_started:.3f}s "
             f"bytes={len(output)}->{len(optimized)}"

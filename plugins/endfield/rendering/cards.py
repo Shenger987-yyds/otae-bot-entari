@@ -31,7 +31,11 @@ from otae_bot.infrastructure.http.client import fetch_many_resilient
 
 from ..cold_start import note_remote_assets, shared_image_namespaces
 from otae_bot.infrastructure.rendering.executor import run_image_render
-from otae_bot.infrastructure.rendering.browser import BrowserResource, screenshot_web_element
+from otae_bot.infrastructure.rendering.browser import (
+    BrowserResource,
+    screenshot_timing,
+    screenshot_web_element,
+)
 from otae_bot.infrastructure.rendering.temp_files import schedule_temp_file_cleanup
 
 from ..catalog.models import (
@@ -174,30 +178,32 @@ async def draw_operator_card(view: OperatorView) -> bytes:
     assets_seconds = perf_counter() - started
     try:
         screenshot_started = perf_counter()
-        output = await screenshot_web_element(
-            html_path.resolve().as_uri(),
-            ".endfield-card",
-            viewport=(prepared.width, 1),
-            timeout_ms=15000,
-            max_height=CARD_MAX_HEIGHT,
-            device_scale_factor=2.0,
-            settle_ms=50,
-            resources=prepared.resources,
-            wait_for_images=True,
-            strict_max_height=True,
-            overflow_selectors=(
-                ".rail",
-                ".info-box",
-                ".potential-item",
-                ".skill-card",
-                ".effect-card",
-                ".metric-table",
-            ),
-        )
+        with screenshot_timing() as timing:
+            output = await screenshot_web_element(
+                html_path.resolve().as_uri(),
+                ".endfield-card",
+                viewport=(prepared.width, 1),
+                timeout_ms=15000,
+                max_height=CARD_MAX_HEIGHT,
+                device_scale_factor=2.0,
+                settle_ms=50,
+                resources=prepared.resources,
+                wait_for_images=True,
+                strict_max_height=True,
+                overflow_selectors=(
+                    ".rail",
+                    ".info-box",
+                    ".potential-item",
+                    ".skill-card",
+                    ".effect-card",
+                    ".metric-table",
+                ),
+            )
         optimize_started = perf_counter()
         optimized = await run_image_render(optimize_png_container, output)
         logger.info(
             f"[endfield] draw kind=operator assets={assets_seconds:.3f}s "
+            f"queue_wait={timing.queue_wait:.3f}s "
             f"screenshot={optimize_started - screenshot_started:.3f}s "
             f"png_optimize={perf_counter() - optimize_started:.3f}s "
             f"bytes={len(output)}->{len(optimized)}"
@@ -214,23 +220,25 @@ async def draw_weapon_card(view: WeaponView) -> bytes:
     assets_seconds = perf_counter() - started
     try:
         screenshot_started = perf_counter()
-        output = await screenshot_web_element(
-            html_path.resolve().as_uri(),
-            ".weapon-card",
-            viewport=(prepared.width, 1),
-            timeout_ms=15000,
-            max_height=CARD_MAX_HEIGHT,
-            device_scale_factor=2.0,
-            settle_ms=50,
-            resources=prepared.resources,
-            wait_for_images=True,
-            strict_max_height=True,
-            overflow_selectors=(".rail", ".panel", ".skill-card", ".level-row"),
-        )
+        with screenshot_timing() as timing:
+            output = await screenshot_web_element(
+                html_path.resolve().as_uri(),
+                ".weapon-card",
+                viewport=(prepared.width, 1),
+                timeout_ms=15000,
+                max_height=CARD_MAX_HEIGHT,
+                device_scale_factor=2.0,
+                settle_ms=50,
+                resources=prepared.resources,
+                wait_for_images=True,
+                strict_max_height=True,
+                overflow_selectors=(".rail", ".panel", ".skill-card", ".level-row"),
+            )
         optimize_started = perf_counter()
         optimized = await run_image_render(optimize_png_container, output)
         logger.info(
             f"[endfield] draw kind=weapon assets={assets_seconds:.3f}s "
+            f"queue_wait={timing.queue_wait:.3f}s "
             f"screenshot={optimize_started - screenshot_started:.3f}s "
             f"png_optimize={perf_counter() - optimize_started:.3f}s "
             f"bytes={len(output)}->{len(optimized)}"
@@ -247,28 +255,30 @@ async def draw_equipment_card(view: EquipmentView) -> bytes:
     assets_seconds = perf_counter() - started
     try:
         screenshot_started = perf_counter()
-        output = await screenshot_web_element(
-            html_path.resolve().as_uri(),
-            ".equipment-card",
-            viewport=(prepared.width, 1),
-            timeout_ms=15000,
-            max_height=CARD_MAX_HEIGHT,
-            device_scale_factor=2.0,
-            settle_ms=50,
-            resources=prepared.resources,
-            wait_for_images=True,
-            strict_max_height=True,
-            overflow_selectors=(
-                ".equipment-left",
-                ".equipment-right",
-                ".equipment-stat",
-                ".equipment-piece",
-            ),
-        )
+        with screenshot_timing() as timing:
+            output = await screenshot_web_element(
+                html_path.resolve().as_uri(),
+                ".equipment-card",
+                viewport=(prepared.width, 1),
+                timeout_ms=15000,
+                max_height=CARD_MAX_HEIGHT,
+                device_scale_factor=2.0,
+                settle_ms=50,
+                resources=prepared.resources,
+                wait_for_images=True,
+                strict_max_height=True,
+                overflow_selectors=(
+                    ".equipment-left",
+                    ".equipment-right",
+                    ".equipment-stat",
+                    ".equipment-piece",
+                ),
+            )
         optimize_started = perf_counter()
         optimized = await run_image_render(optimize_png_container, output)
         logger.info(
             f"[endfield] draw kind=equipment assets={assets_seconds:.3f}s "
+            f"queue_wait={timing.queue_wait:.3f}s "
             f"screenshot={optimize_started - screenshot_started:.3f}s "
             f"png_optimize={perf_counter() - optimize_started:.3f}s "
             f"bytes={len(output)}->{len(optimized)}"
@@ -2032,26 +2042,28 @@ async def draw_equipment_catalog_card(view: EquipmentCatalogView) -> bytes:
     assets_seconds = perf_counter() - started
     try:
         screenshot_started = perf_counter()
-        output = await screenshot_web_element(
-            html_path.resolve().as_uri(),
-            ".equipment-catalog-card",
-            viewport=(prepared.width, 1),
-            timeout_ms=20000,
-            max_height=12000,
-            device_scale_factor=1.5,
-            settle_ms=50,
-            resources=prepared.resources,
-            wait_for_images=True,
-            strict_max_height=True,
-            overflow_selectors=(
-                ".equipment-catalog-group",
-                ".equipment-catalog-item",
-            ),
-        )
+        with screenshot_timing() as timing:
+            output = await screenshot_web_element(
+                html_path.resolve().as_uri(),
+                ".equipment-catalog-card",
+                viewport=(prepared.width, 1),
+                timeout_ms=20000,
+                max_height=12000,
+                device_scale_factor=1.5,
+                settle_ms=50,
+                resources=prepared.resources,
+                wait_for_images=True,
+                strict_max_height=True,
+                overflow_selectors=(
+                    ".equipment-catalog-group",
+                    ".equipment-catalog-item",
+                ),
+            )
         optimize_started = perf_counter()
         optimized = await run_image_render(optimize_png_container, output)
         logger.info(
             f"[endfield] draw kind=equipment_catalog assets={assets_seconds:.3f}s "
+            f"queue_wait={timing.queue_wait:.3f}s "
             f"screenshot={optimize_started - screenshot_started:.3f}s "
             f"png_optimize={perf_counter() - optimize_started:.3f}s "
             f"bytes={len(output)}->{len(optimized)}"
@@ -2104,23 +2116,25 @@ async def _draw_gallery_catalog(
     html_path = _write_temp_html(prepared.html)
     try:
         screenshot_started = perf_counter()
-        output = await screenshot_web_element(
-            html_path.resolve().as_uri(),
-            selector,
-            viewport=(prepared.width, 1),
-            timeout_ms=25000,
-            max_height=12000,
-            device_scale_factor=1.25,
-            settle_ms=50,
-            resources=prepared.resources,
-            wait_for_images=True,
-            strict_max_height=True,
-            overflow_selectors=overflow_selectors,
-        )
+        with screenshot_timing() as timing:
+            output = await screenshot_web_element(
+                html_path.resolve().as_uri(),
+                selector,
+                viewport=(prepared.width, 1),
+                timeout_ms=25000,
+                max_height=12000,
+                device_scale_factor=1.25,
+                settle_ms=50,
+                resources=prepared.resources,
+                wait_for_images=True,
+                strict_max_height=True,
+                overflow_selectors=overflow_selectors,
+            )
         optimize_started = perf_counter()
         optimized = await run_image_render(optimize_png_container, output)
         logger.info(
-            f"[endfield] draw kind={kind} screenshot={optimize_started - screenshot_started:.3f}s "
+            f"[endfield] draw kind={kind} queue_wait={timing.queue_wait:.3f}s "
+            f"screenshot={optimize_started - screenshot_started:.3f}s "
             f"png_optimize={perf_counter() - optimize_started:.3f}s bytes={len(output)}->{len(optimized)}"
         )
         return optimized
