@@ -20,10 +20,12 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote
 
-from otae_bot.infrastructure.http.client import fetch_json
+from loguru import logger
+
+from otae_bot.infrastructure.http.client import clear_http_cache, fetch_json
 
 AKEDATA_DATA_BASE = "https://data.akedata.wiki"
 AKEDATA_ICON_BASE = (
@@ -46,16 +48,25 @@ AKEDATA_TIMEOUT_SECONDS = 30.0
 # I18nTextTable_CN 约 18MB，超过 fetch_json 默认 10MB 上限。
 _I18N_MAX_BYTES = 64 * 1024 * 1024
 _I18N_SUFFIX = "/I18nTextTable_CN.json"
+# 当前版本 I18n 在内存常驻槽里留多久：表路径按版本寻址，同一路径内容不变；
+# 按需刷新时显式重新校验，manifest 换版本时整组清掉。
+I18N_TTL_SECONDS = 24 * 3600.0
+# manifest：60 秒内直接用；60–600 秒先返回旧值、后台刷新；更久没刷新过才等网络。
+MANIFEST_FRESH_SECONDS = 60.0
+MANIFEST_STALE_LIMIT_SECONDS = 600.0
+# 刷新失败后继续用旧值，隔这么久再在后台试一次；告警最多这么久一条。
+MANIFEST_RETRY_SECONDS = 30.0
+MANIFEST_WARNING_INTERVAL_SECONDS = 300.0
 # Path of the I18n table successfully loaded into memory in this process.
 # None until that read returns; cleared when /ef dev drops the akedata cache.
 _i18n_loaded_path: str | None = None
-# Exact path of that read; keeps the on-demand refresh token (``?v=``) so the
-# cold-start check probes the same cache key the refresh wrote.
-_i18n_loaded_request: str | None = None
+# Table path -> refresh token it was last revalidated for. One refresh batch
+# reads the shared I18n twice (medals, archives) but asks the server once.
+_revalidated: dict[str, str] = {}
 
 
 def normalize_table_path(path: str) -> str:
-    """Cache identity of a table: drop the on-demand refresh token (``?v=``)."""
+    """Cache identity of a table path, without any query string."""
     return "/" + str(path or "").split("?", 1)[0].lstrip("/")
 
 
@@ -64,25 +75,30 @@ def i18n_loaded_path() -> str | None:
 
 
 def i18n_loaded_request_path() -> str | None:
-    return _i18n_loaded_request
+    """Kept for callers of the old refresh-token paths; table reads no longer carry one."""
+    return _i18n_loaded_path
 
 
 def i18n_process_warm() -> bool:
     return _i18n_loaded_path is not None
 
 
-def clear_i18n_process_warm() -> None:
-    global _i18n_loaded_path, _i18n_loaded_request
+def _forget_i18n_loaded() -> None:
+    global _i18n_loaded_path
     _i18n_loaded_path = None
-    _i18n_loaded_request = None
+    _revalidated.clear()
+
+
+def clear_i18n_process_warm() -> None:
+    _forget_i18n_loaded()
+    reset_manifest_state()
 
 
 def remember_i18n_loaded(path: str) -> None:
-    global _i18n_loaded_path, _i18n_loaded_request
+    global _i18n_loaded_path
     normalized = normalize_table_path(path)
     if normalized.endswith(_I18N_SUFFIX):
         _i18n_loaded_path = normalized
-        _i18n_loaded_request = "/" + str(path or "").lstrip("/")
 
 
 def i18n_path_from_manifest(manifest: dict[str, Any]) -> str | None:
@@ -107,7 +123,12 @@ async def _get(
     *,
     max_bytes: int = 10 * 1024 * 1024,
     ttl_seconds: float | None = None,
+    cache_token: str = "",
 ) -> Any:
+    """``cache_token`` (one per on-demand refresh) revalidates the table once per token."""
+    if ttl_seconds is None and path.endswith(_I18N_SUFFIX):
+        ttl_seconds = I18N_TTL_SECONDS
+    revalidate = bool(cache_token) and _revalidated.get(path) != cache_token
     payload = await fetch_json(
         f"{AKEDATA_DATA_BASE}{path}",
         namespace="akedata",
@@ -116,17 +137,104 @@ async def _get(
         max_bytes=max_bytes,
         read_only=True,
         **({"ttl_seconds": ttl_seconds} if ttl_seconds is not None else {}),
+        **({"revalidate": True} if revalidate else {}),
     )
+    if revalidate:
+        _revalidated[path] = cache_token
     remember_i18n_loaded(path)
     return payload
 
 
+@dataclass
+class _ManifestState:
+    value: dict[str, Any] | None = None
+    fetched_at: float = 0.0  # time.monotonic() of the last successful fetch
+    retry_at: float = 0.0
+    warned_at: float = float("-inf")
+    task: asyncio.Task | None = None
+
+
+_manifest = _ManifestState()
+
+
+def reset_manifest_state() -> None:
+    """Forget the cached manifest; a refresh still running publishes nowhere."""
+    global _manifest
+    _manifest = _ManifestState()
+
+
 async def fetch_akedata_manifest() -> dict[str, Any]:
-    """``manifest.json`` → ``{latest, versions:[{id, tableCfgPath, ...}], sharedRevision}``。"""
-    manifest = await _get(f"/manifest.json?t={int(time.time() // 60)}", ttl_seconds=60.0)
-    if not isinstance(manifest, dict) or not manifest.get("latest"):
-        raise RuntimeError("AKEData manifest 结构异常")
+    """``manifest.json`` → ``{latest, versions:[{id, tableCfgPath, ...}], sharedRevision}``。
+
+    Stale-while-revalidate: a manifest younger than ``MANIFEST_FRESH_SECONDS``
+    is returned as is; one younger than ``MANIFEST_STALE_LIMIT_SECONDS`` is
+    returned while a single background task refreshes it; otherwise callers
+    wait for that refresh. A failed refresh keeps serving the last manifest.
+    """
+    state = _manifest
+    now = time.monotonic()
+    if state.value is not None:
+        age = now - state.fetched_at
+        if age < MANIFEST_FRESH_SECONDS:
+            return state.value
+        if age < MANIFEST_STALE_LIMIT_SECONDS:
+            if now >= state.retry_at:
+                _manifest_refresh(state)
+            return state.value
+    return await asyncio.shield(_manifest_refresh(state))
+
+
+def _manifest_refresh(state: _ManifestState) -> asyncio.Task:
+    """The one refresh task for ``state`` on this loop, started if none is running."""
+    loop = asyncio.get_running_loop()
+    task = state.task
+    if task is None or task.done() or task.get_loop() is not loop:
+        task = loop.create_task(_load_manifest(state))
+        # Background refreshes may have no awaiter; retrieve their outcome.
+        task.add_done_callback(lambda done: done.cancelled() or done.exception())
+        state.task = task
+    return task
+
+
+async def _load_manifest(state: _ManifestState) -> dict[str, Any]:
+    try:
+        # ``?t=`` busts CDN caches per minute; the state above is the memory cache.
+        manifest = await _get(f"/manifest.json?t={int(time.time() // 60)}", ttl_seconds=0)
+        if not isinstance(manifest, dict) or not manifest.get("latest"):
+            raise RuntimeError("AKEData manifest 结构异常")
+    except Exception as exc:
+        if state.value is None:
+            raise
+        now = time.monotonic()
+        # Keep the last good manifest inside the stale window, so callers do not
+        # wait on a failing network; try again in the background later.
+        state.fetched_at = now - MANIFEST_FRESH_SECONDS
+        state.retry_at = now + MANIFEST_RETRY_SECONDS
+        if now - state.warned_at >= MANIFEST_WARNING_INTERVAL_SECONDS:
+            state.warned_at = now
+            logger.warning(
+                f"[akedata] manifest refresh failed; keeping latest={state.value.get('latest')} "
+                f"({type(exc).__name__}: {exc})"
+            )
+        return state.value
+    previous = state.value
+    state.value = manifest
+    state.fetched_at = time.monotonic()
+    state.retry_at = 0.0
+    if previous is not None and _manifest_revision(previous) != _manifest_revision(manifest):
+        logger.info(
+            f"[akedata] manifest changed latest={previous.get('latest')}->{manifest.get('latest')} "
+            f"sharedRevision={previous.get('sharedRevision')}->{manifest.get('sharedRevision')}; "
+            "dropping cached tables"
+        )
+        if _manifest is state:  # not reset meanwhile
+            _forget_i18n_loaded()
+            await clear_http_cache("akedata", include_disk=False)
     return manifest
+
+
+def _manifest_revision(manifest: dict[str, Any]) -> tuple[Any, Any]:
+    return manifest.get("latest"), manifest.get("sharedRevision")
 
 
 def latest_version_entry(manifest: dict[str, Any]) -> dict[str, Any]:
@@ -141,10 +249,10 @@ def latest_version_entry(manifest: dict[str, Any]) -> dict[str, Any]:
     return entry
 
 
-def _table_path(table_cfg: str, name: str, cache_token: str) -> str:
-    path = f"/{table_cfg.strip('/')}/{name}.json"
-    # One token per refresh shares i18n within the batch, bypassing older cached tables.
-    return f"{path}?v={quote(cache_token, safe='')}" if cache_token else path
+def _table_path(table_cfg: str, name: str) -> str:
+    # Always the version path: an on-demand refresh revalidates it (``_get(cache_token=)``)
+    # instead of reading a second, token-suffixed copy.
+    return f"/{table_cfg.strip('/')}/{name}.json"
 
 
 async def fetch_akedata_medal_tables(
@@ -157,9 +265,13 @@ async def fetch_akedata_medal_tables(
     entry = latest_version_entry(manifest)
     table_cfg = str(entry["tableCfgPath"]).lstrip("/")
     achievement, type_table, i18n = await asyncio.gather(
-        _get(_table_path(table_cfg, "AchievementTable", cache_token)),
-        _get(_table_path(table_cfg, "AchievementTypeTable", cache_token)),
-        _get(_table_path(table_cfg, "I18nTextTable_CN", cache_token), max_bytes=_I18N_MAX_BYTES),
+        _get(_table_path(table_cfg, "AchievementTable"), cache_token=cache_token),
+        _get(_table_path(table_cfg, "AchievementTypeTable"), cache_token=cache_token),
+        _get(
+            _table_path(table_cfg, "I18nTextTable_CN"),
+            max_bytes=_I18N_MAX_BYTES,
+            cache_token=cache_token,
+        ),
     )
     return achievement, type_table, i18n, latest
 
@@ -210,8 +322,9 @@ async def fetch_akedata_achievement_table(
     默认长 TTL——历史版本内容恒定；latest 版本调用方可传 None 走默认 600s。
     """
     table = await _get(
-        _table_path(str(table_cfg), "AchievementTable", cache_token),
+        _table_path(str(table_cfg), "AchievementTable"),
         ttl_seconds=ttl_seconds,
+        cache_token=cache_token,
     )
     return table if isinstance(table, dict) else {}
 
@@ -235,11 +348,15 @@ async def fetch_akedata_archive_tables(
     entry = latest_version_entry(manifest)
     table_cfg = str(entry["tableCfgPath"]).lstrip("/")
     page, category, first_lv, all_item, i18n = await asyncio.gather(
-        _get(_table_path(table_cfg, "PrtsPage", cache_token)),
-        _get(_table_path(table_cfg, "PrtsCategory", cache_token)),
-        _get(_table_path(table_cfg, "PrtsFirstLv", cache_token)),
-        _get(_table_path(table_cfg, "PrtsAllItem", cache_token)),
-        _get(_table_path(table_cfg, "I18nTextTable_CN", cache_token), max_bytes=_I18N_MAX_BYTES),
+        _get(_table_path(table_cfg, "PrtsPage"), cache_token=cache_token),
+        _get(_table_path(table_cfg, "PrtsCategory"), cache_token=cache_token),
+        _get(_table_path(table_cfg, "PrtsFirstLv"), cache_token=cache_token),
+        _get(_table_path(table_cfg, "PrtsAllItem"), cache_token=cache_token),
+        _get(
+            _table_path(table_cfg, "I18nTextTable_CN"),
+            max_bytes=_I18N_MAX_BYTES,
+            cache_token=cache_token,
+        ),
     )
     return page, category, first_lv, all_item, i18n, latest
 
@@ -253,7 +370,8 @@ async def fetch_akedata_prts_all_item(
     历史版本内容恒定，默认长 TTL；latest 版本调用方可传 None 走默认 600s。
     """
     table = await _get(
-        _table_path(str(table_cfg), "PrtsAllItem", cache_token),
+        _table_path(str(table_cfg), "PrtsAllItem"),
         ttl_seconds=ttl_seconds,
+        cache_token=cache_token,
     )
     return table if isinstance(table, dict) else {}

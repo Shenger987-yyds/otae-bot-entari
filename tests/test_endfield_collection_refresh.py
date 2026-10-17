@@ -462,29 +462,41 @@ class PinnedProviderTest(unittest.IsolatedAsyncioTestCase):
         fetch_manifest.assert_not_awaited()
         paths = [call.args[0] for call in get.await_args_list]
         self.assertTrue(all(p.startswith("/public/1.5.3/10506507-7/TableCfg/") for p in paths))
-        self.assertTrue(all(p.endswith("?v=refresh-1") for p in paths))
+        # Version paths only: the refresh token asks for revalidation instead of a second copy.
+        self.assertTrue(all("?" not in p for p in paths))
+        self.assertTrue(
+            all(call.kwargs["cache_token"] == "refresh-1" for call in get.await_args_list)
+        )
         self.assertEqual(len([p for p in paths if "I18nTextTable_CN" in p]), 2)
         self.assertEqual(medals[-1], pinned["latest"])
         self.assertEqual(archives[-1], pinned["latest"])
 
-    async def test_refresh_token_keeps_i18n_warm_for_cold_start_checks(self):
-        """A ``?v=`` refresh read must still count as a warm I18n read."""
+    async def test_refresh_token_revalidates_each_table_once_and_keeps_i18n_warm(self):
         pinned = manifest()
         akedata.clear_i18n_process_warm()
         self.addCleanup(akedata.clear_i18n_process_warm)
         with patch.object(akedata, "fetch_json", AsyncMock(return_value={"ok": {}})) as fetch:
             await akedata.fetch_akedata_medal_tables(manifest=pinned, cache_token="refresh-1")
+            await akedata.fetch_akedata_archive_tables(manifest=pinned, cache_token="refresh-1")
+            await akedata.fetch_akedata_medal_tables(manifest=pinned, cache_token="refresh-2")
+            await akedata.fetch_akedata_medal_tables(manifest=pinned)
         requested = [
-            call.args[0] for call in fetch.await_args_list if "I18nTextTable_CN" in call.args[0]
+            call for call in fetch.await_args_list if "I18nTextTable_CN" in call.args[0]
         ]
-        self.assertEqual(len(requested), 1)
-        # Cache identity drops the token, so it still matches the manifest path.
+        self.assertEqual(len(requested), 4)
+        # Shared within a batch: asked again only for the first read of each token.
+        self.assertEqual(
+            [call.kwargs.get("revalidate", False) for call in requested], [True, False, True, False]
+        )
+        self.assertTrue(all("?" not in call.args[0] for call in fetch.await_args_list))
+        self.assertEqual(requested[0].kwargs["ttl_seconds"], akedata.I18N_TTL_SECONDS)
+        i18n_url = requested[0].args[0]
         self.assertEqual(
             akedata.i18n_loaded_path(),
             "/public/1.5.3/10506507-7/TableCfg/I18nTextTable_CN.json",
         )
         self.assertTrue(akedata.i18n_process_warm())
-        self.assertTrue(akedata.i18n_loaded_request_path().endswith("?v=refresh-1"))
+        self.assertEqual(akedata.i18n_loaded_request_path(), akedata.i18n_loaded_path())
         with (
             patch.object(cold_start, "fetch_akedata_manifest", AsyncMock(return_value=pinned)),
             patch.object(
@@ -492,8 +504,8 @@ class PinnedProviderTest(unittest.IsolatedAsyncioTestCase):
             ) as cached,
         ):
             self.assertFalse(await cold_start.ake_public_tables_cold())
-        # The probe must use the path the refresh really wrote, not the token-less one.
-        self.assertEqual(cached.await_args.args[0], requested[0])
+        # The probe checks the same version path the refresh read.
+        self.assertEqual(cached.await_args.args[0], i18n_url)
         with (
             patch.object(cold_start, "fetch_akedata_manifest", AsyncMock(return_value=pinned)),
             patch.object(cold_start, "cached_public_resource", AsyncMock(return_value=False)),
