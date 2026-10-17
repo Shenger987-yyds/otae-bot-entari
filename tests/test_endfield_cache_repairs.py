@@ -713,6 +713,27 @@ class CacheStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all("超限" in line for line in lines[:6]))
         self.assertEqual(lines[-1], "缓存策略: 成品图 TTL 1800s / 下载并发 8")
 
+    async def test_status_shows_the_render_queue(self):
+        diagnostics = {
+            "pools": {
+                "assets": {"bytes": 0, "budget_bytes": 64 * 1024 * 1024},
+                "i18n": {"bytes": 0, "budget_bytes": 64 * 1024 * 1024},
+            },
+            "namespaces": {},
+        }
+        snapshot = {
+            "inflight": 2,
+            "waiting": {"interactive": 1, "background": 0},
+            "concurrency": 2,
+            "contexts": 2,
+        }
+        with (
+            patch.object(endfield, "get_http_cache_diagnostics", AsyncMock(return_value=diagnostics)),
+            patch.object(endfield, "browser_queue_snapshot", return_value=snapshot),
+        ):
+            lines = await endfield._cache_status_lines()
+        self.assertEqual(lines[-2], "浏览器: 在途 2 / 排队 交互 1 后台 0 / 并发 2 / context 2")
+
 
 class MedalPaginationRepairTests(unittest.IsolatedAsyncioTestCase):
     async def test_height_limit_retries_smaller_pages_and_other_errors_propagate(self):
@@ -720,18 +741,22 @@ class MedalPaginationRepairTests(unittest.IsolatedAsyncioTestCase):
 
         view = SimpleNamespace(new_medals=list(range(5)))
         failure = RuntimeError("Screenshot element height 999 exceeds limit 100")
+
+        async def render(_view, medals, page_number, _page_count):
+            if len(medals) > 2:  # only two-medal pages fit
+                raise failure
+            return str(page_number).encode()
+
         with (
             patch.object(cards, "MEDAL_PAGE_BUDGETS", (3, 2)),
-            patch.object(
-                cards,
-                "_draw_medal_stats_page",
-                AsyncMock(side_effect=[failure, failure, b"1", b"2", b"3"]),
-            ) as draw,
+            patch.object(cards, "_draw_medal_stats_page", AsyncMock(side_effect=render)) as draw,
         ):
             self.assertEqual(
                 await cards.draw_medal_stats_card(view), (b"1", b"2", b"3")
             )
-            self.assertEqual(draw.await_count, 5)
+            # One image, then budget 3 (overflows), then budget 2 rendered in page order.
+            self.assertEqual(draw.await_args_list[0].args[1], [0, 1, 2, 3, 4])
+            self.assertEqual([call.args[1] for call in draw.await_args_list[-3:]], [[0, 1], [2, 3], [4]])
         with patch.object(
             cards,
             "_draw_medal_stats_page",

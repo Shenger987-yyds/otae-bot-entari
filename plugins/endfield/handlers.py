@@ -58,6 +58,7 @@ from otae_bot.infrastructure.http.client import (
     get_http_cache_diagnostics,
     get_http_cache_stats,
 )
+from otae_bot.infrastructure.rendering.browser import browser_queue_snapshot
 from otae_bot.infrastructure.rendering.temp_files import schedule_temp_file_cleanup
 
 from .providers.warfarin import WarfarinAPIError, WarfarinClient
@@ -3818,8 +3819,18 @@ async def _cache_status_lines() -> list[str]:
         _format_cache_stats("账号卡片", account_stats),
         _format_memory_pools(diagnostics),
         *_format_asset_queue(diagnostics.get("broker")),
+        _format_browser_queue(browser_queue_snapshot()),
         f"缓存策略: 成品图 TTL {int(RENDER_CACHE_TTL_SECONDS)}s / 下载并发 8",
     ]
+
+
+def _format_browser_queue(snapshot: dict) -> str:
+    """Render slots in use, renders waiting by priority, slot count and pooled browser contexts."""
+    waiting = snapshot["waiting"]
+    return (
+        f"浏览器: 在途 {snapshot['inflight']} / 排队 交互 {waiting['interactive']} 后台 {waiting['background']} / "
+        f"并发 {snapshot['concurrency']} / context {snapshot['contexts']}"
+    )
 
 
 def _format_asset_queue(snapshot: dict | None) -> list[str]:

@@ -927,7 +927,7 @@ class EndfieldChallengeTests(unittest.TestCase):
         ):
             self.assertNotIn(absent, urls)
 
-    def test_war_history_batch_prepares_once_and_renders_serially(self):
+    def test_war_history_batch_prepares_once_and_renders_pages_in_parallel(self):
         payload = parse_war_echoes(_war_fixture())
         identity = ChallengeIdentity("脱敏账号", "国服", "****1234")
         hero = "https://endfield.local/assets/war-header"
@@ -946,7 +946,7 @@ class EndfieldChallengeTests(unittest.TestCase):
             max_active = max(max_active, active)
             pages.append(page)
             documents.append(document)
-            await asyncio.sleep(0)  # 让出事件循环：若被并发调度，另一页会在此期间开始渲染
+            await asyncio.sleep(0)  # 让出事件循环：并发调度时另一页在此期间开始渲染
             active -= 1
             return f"png-{page}".encode()
 
@@ -967,8 +967,8 @@ class EndfieldChallengeTests(unittest.TestCase):
 
         result = asyncio.run(run())
         self.assertEqual(result, (b"png-1", b"png-2"))
-        self.assertEqual(pages, [1, 2])
-        self.assertEqual(max_active, 1)
+        self.assertEqual(sorted(pages), [1, 2])
+        self.assertEqual(max_active, 2)
         self.assertTrue(all(hero in document for document in documents))
 
     def test_challenge_renderer_uses_bounded_cdp_export(self):

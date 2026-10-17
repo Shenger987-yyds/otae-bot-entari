@@ -2361,12 +2361,21 @@ class EndfieldStageCatalogPaginationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_budget_that_still_overflows_falls_through_to_a_smaller_one(self):
         overflow = RuntimeError("Screenshot element height 14007px exceeds limit 12000px")
-        renderer = AsyncMock(side_effect=[overflow, overflow, overflow, b"a", b"b", b"c", b"d"])
 
+        async def render(page):
+            # Only pages of at most 50 entries fit; pages of one budget render in parallel.
+            if sum(len(group.items) for group in page.groups) > 50:
+                raise overflow
+            return f"{page.page_number}/{page.page_count}".encode()
+
+        renderer = AsyncMock(side_effect=render)
         with patch.object(stage_draw, "draw_stage_catalog_card", renderer):
             pages = await stage_draw.draw_stage_catalog_cards(_big_catalog(1, 160))
 
-        self.assertEqual(pages, (b"a", b"b", b"c", b"d"))
+        self.assertEqual(pages, (b"1/4", b"2/4", b"3/4", b"4/4"))
+        budgets = [call.args[0].page_count for call in renderer.await_args_list]
+        self.assertEqual(budgets[0], 1)  # the single image is tried first
+        self.assertEqual(budgets[-4:], [4, 4, 4, 4])  # 120 and 80 overflowed, 50 fits
 
 
 if __name__ == "__main__":

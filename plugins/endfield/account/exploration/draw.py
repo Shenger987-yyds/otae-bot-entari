@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import math
 from dataclasses import replace
+from functools import partial
+
+from otae_bot.infrastructure.rendering.pages import render_pages
 
 from ...cold_start import REMOTE_ASSET_NAMESPACE, note_remote_assets
 from ...rendering.cards import (
@@ -77,34 +80,40 @@ async def draw_exploration_cards(view: ExplorationView) -> tuple[bytes, ...]:
     for budget in (PAGE_ROWS, 12, 6, 1):
         pages = paginate_exploration(view, budget)
         try:
-            images = []
-            for index, page in enumerate(pages, 1):
-                prepared = await prepare_exploration_html(
-                    page,
-                    thumbnails=thumbnails,
-                    page_number=index,
-                    page_count=len(pages),
-                )
-                images.append(
-                    await _draw_gallery_catalog(
-                        prepared,
-                        ".exploration-card",
-                        (
-                            ".exploration-header",
-                            ".exploration-summary",
-                            ".exploration-table",
-                            ".legend",
-                            ".exploration-footer",
-                        ),
-                        "account_exploration",
-                    )
-                )
-            return tuple(images)
+            return await render_pages(
+                [
+                    partial(_draw_exploration_page, page, thumbnails, index, len(pages))
+                    for index, page in enumerate(pages, 1)
+                ]
+            )
         except RuntimeError as exc:
             if not is_height_limit_error(exc):
                 raise
             last_error = exc
     raise last_error or RuntimeError("地区探索图片分页失败")
+
+
+async def _draw_exploration_page(
+    page: ExplorationView, thumbnails: ThumbnailMap, page_number: int, page_count: int
+) -> bytes:
+    prepared = await prepare_exploration_html(
+        page,
+        thumbnails=thumbnails,
+        page_number=page_number,
+        page_count=page_count,
+    )
+    return await _draw_gallery_catalog(
+        prepared,
+        ".exploration-card",
+        (
+            ".exploration-header",
+            ".exploration-summary",
+            ".exploration-table",
+            ".legend",
+            ".exploration-footer",
+        ),
+        "account_exploration",
+    )
 
 
 async def prepare_exploration_html(

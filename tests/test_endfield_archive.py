@@ -508,11 +508,17 @@ class ArchivePreviewTest(unittest.IsolatedAsyncioTestCase):
         items = [_make_item(f"id_{i}") for i in range(5)]
         view = ArchiveDiffView(new_items=items)
         failure = RuntimeError("Screenshot element height 999 exceeds limit 100")
+
+        async def render(_view, chunk, page_number, _page_count, _icons, _total):
+            if len(chunk) > 2:  # only two-item pages fit
+                raise failure
+            return str(page_number).encode()
+
         with (
             patch.object(cards, "ARCHIVE_PREVIEW_LIMIT", 5),
             patch.object(cards, "ARCHIVE_PAGE_BUDGETS", (3, 2)),
             patch.object(cards, "_image_data_urls", AsyncMock(return_value={})) as assets,
-            patch.object(cards, "_draw_archive_stats_page", AsyncMock(side_effect=[failure, failure, b"1", b"2", b"3"])) as draw,
+            patch.object(cards, "_draw_archive_stats_page", AsyncMock(side_effect=render)) as draw,
         ):
             self.assertEqual(await cards.draw_archive_stats_card(view), (b"1", b"2", b"3"))
         assets.assert_awaited_once()

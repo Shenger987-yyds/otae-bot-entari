@@ -8,7 +8,7 @@ from time import perf_counter
 from loguru import logger
 
 from otae_bot.infrastructure.rendering.executor import run_image_render
-from otae_bot.infrastructure.rendering.browser import screenshot_web_element
+from otae_bot.infrastructure.rendering.browser import screenshot_timing, screenshot_web_element
 from otae_bot.infrastructure.rendering.temp_files import schedule_temp_file_cleanup
 
 from ..cold_start import REMOTE_ASSET_NAMESPACE, note_remote_assets
@@ -36,23 +36,25 @@ async def draw_official_version_calendar(calendar: OfficialVersionCalendar) -> b
     target_height = official_calendar_height(calendar)
     try:
         screenshot_started = perf_counter()
-        output = await screenshot_web_element(
-            html_path.resolve().as_uri(),
-            ".official-version-calendar",
-            viewport=(CALENDAR_WIDTH, target_height),
-            timeout_ms=20000,
-            max_height=MAX_CALENDAR_HEIGHT,
-            device_scale_factor=1.0,
-            settle_ms=50,
-            resources=prepared.resources,
-            wait_for_images=True,
-            strict_max_height=True,
-            overflow_selectors=(".official-version-calendar",),
-        )
+        with screenshot_timing() as timing:
+            output = await screenshot_web_element(
+                html_path.resolve().as_uri(),
+                ".official-version-calendar",
+                viewport=(CALENDAR_WIDTH, target_height),
+                timeout_ms=20000,
+                max_height=MAX_CALENDAR_HEIGHT,
+                device_scale_factor=1.0,
+                settle_ms=50,
+                resources=prepared.resources,
+                wait_for_images=True,
+                strict_max_height=True,
+                overflow_selectors=(".official-version-calendar",),
+            )
         optimize_started = perf_counter()
         optimized = await run_image_render(optimize_png_container, output)
         logger.info(
             f"[endfield] draw kind=official_version_calendar assets={assets_seconds:.3f}s "
+            f"queue_wait={timing.queue_wait:.3f}s "
             f"screenshot={optimize_started - screenshot_started:.3f}s "
             f"png_optimize={perf_counter() - optimize_started:.3f}s "
             f"bytes={len(output)}->{len(optimized)} revision={calendar.revision}"

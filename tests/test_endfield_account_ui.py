@@ -579,13 +579,18 @@ class EndfieldAccountDetailPaginationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_budget_that_still_overflows_falls_through_to_a_smaller_one(self):
         overflow = RuntimeError("Screenshot element height 12997px exceeds limit 12000px")
-        # The 60-per-page split still overflows; the 40-per-page split fits.
-        renderer = mock.AsyncMock(side_effect=[overflow, b"a", b"b", b"c"])
 
+        async def render(page):
+            # The 60-per-page split still overflows; the 40-per-page split fits.
+            if len(page.operators) > 40:
+                raise overflow
+            return f"{page.page_number}/{page.page_count}".encode()
+
+        renderer = mock.AsyncMock(side_effect=render)
         with mock.patch.object(account_detail_draw, "draw_account_detail_card", renderer):
             pages = await account_detail_draw.draw_account_detail_cards(self.build_view(100))
 
-        self.assertEqual(pages, (b"a", b"b", b"c"))
+        self.assertEqual(pages, (b"1/3", b"2/3", b"3/3"))
         self.assertEqual(renderer.await_args_list[-1].args[0].page_count, 3)
 
 

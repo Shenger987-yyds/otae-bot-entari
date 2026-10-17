@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from functools import partial
 
 from loguru import logger
+
+from otae_bot.infrastructure.rendering.pages import render_pages
 
 from .models import (
     ACCOUNT_DETAIL_PAGE_BUDGETS,
@@ -76,7 +79,7 @@ async def draw_account_detail_cards(view: AccountDetailView) -> tuple[bytes, ...
     for operator_budget in ACCOUNT_DETAIL_PAGE_BUDGETS:
         pages = _paginate_operators(view, operator_budget)
         try:
-            rendered = [await draw_account_detail_card(page) for page in pages]
+            rendered = await render_pages([partial(draw_account_detail_card, page) for page in pages])
         except RuntimeError as exc:
             if not is_height_limit_error(exc):
                 raise

@@ -18,7 +18,7 @@ import html
 import mimetypes
 import os
 from dataclasses import dataclass, field, replace
-from functools import lru_cache
+from functools import lru_cache, partial
 from itertools import accumulate
 from pathlib import Path
 from time import perf_counter
@@ -26,8 +26,9 @@ from typing import Callable, Sequence
 
 from loguru import logger
 
-from otae_bot.infrastructure.rendering.browser import evaluate_web_page, screenshot_web_element
+from otae_bot.infrastructure.rendering.browser import evaluate_web_page, screenshot_timing, screenshot_web_element
 from otae_bot.infrastructure.rendering.executor import run_image_render
+from otae_bot.infrastructure.rendering.pages import render_pages
 from otae_bot.infrastructure.rendering.temp_files import schedule_temp_file_cleanup
 from otae_bot.paths import PROJECT_ROOT
 
@@ -1153,12 +1154,13 @@ async def draw_gacha_analysis_cards(view: GachaAnalysis, *, uid: str) -> tuple[b
     for safety in (GACHA_PAGE_SAFETY, GACHA_RETRY_SAFETY):
         pages, info = paginate_gacha(columns, unit_lists, measure, safety=safety)
         try:
-            pngs = [
-                await _draw_gacha_shell(render_gacha_page_html(
-                    view, columns, page_units, rows, uid=uid, page_no=index, page_count=len(pages),
-                ))
-                for index, page_units in enumerate(pages, start=1)
-            ]
+            with screenshot_timing() as timing:
+                pngs = await render_pages([
+                    partial(_draw_gacha_shell, render_gacha_page_html(
+                        view, columns, page_units, rows, uid=uid, page_no=index, page_count=len(pages),
+                    ))
+                    for index, page_units in enumerate(pages, start=1)
+                ])
         except Exception as exc:
             if isinstance(exc, RuntimeError) and is_height_limit_error(exc) and safety == GACHA_PAGE_SAFETY:
                 logger.warning(f"[endfield-gacha] v3 page exceeded height, repacking with safety={GACHA_RETRY_SAFETY}: {exc}")
@@ -1170,7 +1172,8 @@ async def draw_gacha_analysis_cards(view: GachaAnalysis, *, uid: str) -> tuple[b
         logger.info(
             f"[endfield-gacha] v3 pages={len(pages)} columns={'|'.join(column.spec.key for column in columns)} "
             f"width={GACHA_CARD_WIDTH} level={info.get('level')} tries={info.get('tries')} "
-            f"safety={safety} measure={measured_at - started:.2f}s total={perf_counter() - started:.2f}s"
+            f"safety={safety} measure={measured_at - started:.2f}s queue_wait={timing.queue_wait:.3f}s "
+            f"total={perf_counter() - started:.2f}s"
         )
         return tuple(pngs)
     raise AssertionError("unreachable")  # pragma: no cover - 第二轮要么返回要么回退

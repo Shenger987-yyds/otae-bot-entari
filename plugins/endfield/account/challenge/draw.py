@@ -6,6 +6,7 @@ Models and parsing remain re-exported for callers of the original combined API.
 from __future__ import annotations
 
 import re
+from functools import partial
 from time import perf_counter, time
 from typing import Any, Sequence
 
@@ -27,6 +28,7 @@ async def _noted_challenge_assets(urls, *, inline: bool = False):
     return await _prepare_assets(urls, inline=inline)
 from otae_bot.infrastructure.rendering.executor import run_image_render
 from otae_bot.infrastructure.rendering.browser import screenshot_timing, screenshot_web_element
+from otae_bot.infrastructure.rendering.pages import render_pages
 from otae_bot.infrastructure.rendering.temp_files import schedule_temp_file_cleanup
 
 
@@ -212,7 +214,7 @@ async def draw_monument_history_pages(
     *,
     variant: str = DEFAULT_VARIANT,
 ) -> tuple[bytes, ...]:
-    """Prepare archive assets once and export pages serially on the browser worker."""
+    """Prepare archive assets once, then export the pages in parallel render slots."""
     normalized_pages = tuple(tuple(groups) for groups in pages)
     if not normalized_pages:
         return ()
@@ -222,7 +224,7 @@ async def draw_monument_history_pages(
         kind="monument_history_all",
         page_count=len(normalized_pages),
     )
-    rendered: list[bytes] = []
+    jobs = []
     for index, groups in enumerate(normalized_pages, 1):
         if _monument_history_has_records(groups):
             document = _monument_history_html(
@@ -232,8 +234,9 @@ async def draw_monument_history_pages(
         else:
             document = _empty_html(identity, "影拓丰碑", "暂无历史主题记录", variant)
             resources = {}
-        rendered.append(
-            await _render_challenge(
+        jobs.append(
+            partial(
+                _render_challenge,
                 document,
                 resources,
                 kind="monument_history",
@@ -241,7 +244,7 @@ async def draw_monument_history_pages(
                 page_count=len(normalized_pages),
             )
         )
-    return tuple(rendered)
+    return await render_pages(jobs)
 
 
 async def draw_war_overview(identity: ChallengeIdentity, payload: WarEchoPayload, *, variant: str = DEFAULT_VARIANT) -> bytes:
@@ -306,7 +309,7 @@ async def draw_war_history_pages(
     achievements: Sequence[WarAchievement] = (),
     variant: str = DEFAULT_VARIANT,
 ) -> tuple[bytes, ...]:
-    """Fetch shared history assets once, then render every season in page order."""
+    """Fetch shared history assets once, then render the seasons in parallel, in page order."""
     normalized_seasons = tuple(seasons)
     if not normalized_seasons:
         return ()
@@ -315,7 +318,7 @@ async def draw_war_history_pages(
         kind="war_history_all",
         page_count=len(normalized_seasons),
     )
-    rendered: list[bytes] = []
+    jobs = []
     for index, season in enumerate(normalized_seasons, 1):
         if _war_history_has_records(season, achievements):
             document = _war_history_html(
@@ -331,8 +334,9 @@ async def draw_war_history_pages(
         else:
             document = _empty_html(identity, "战争回响", "暂无历史赛季记录", variant)
             resources = {}
-        rendered.append(
-            await _render_challenge(
+        jobs.append(
+            partial(
+                _render_challenge,
                 document,
                 resources,
                 kind="war_history",
@@ -340,7 +344,7 @@ async def draw_war_history_pages(
                 page_count=len(normalized_seasons),
             )
         )
-    return tuple(rendered)
+    return await render_pages(jobs)
 
 
 async def draw_challenge_empty(

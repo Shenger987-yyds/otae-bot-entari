@@ -20,7 +20,7 @@ import unicodedata
 import zlib
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
-from functools import lru_cache
+from functools import lru_cache, partial
 from io import BytesIO
 from pathlib import Path
 from time import perf_counter
@@ -41,6 +41,7 @@ from otae_bot.infrastructure.rendering.browser import (
     screenshot_timing,
     screenshot_web_element,
 )
+from otae_bot.infrastructure.rendering.pages import render_pages
 from otae_bot.infrastructure.rendering.temp_files import schedule_temp_file_cleanup
 
 from ..catalog.models import (
@@ -1320,10 +1321,11 @@ async def draw_medal_stats_card(view: MedalDiffView) -> tuple[bytes, ...]:
     last_error: RuntimeError | None = None
     for budget in MEDAL_PAGE_BUDGETS:
         chunks = [new_medals[i:i + budget] for i in range(0, len(new_medals), budget)]
-        pages: list[bytes] = []
         try:
-            for index, chunk in enumerate(chunks):
-                pages.append(await _draw_medal_stats_page(view, chunk, index + 1, len(chunks)))
+            pages = await render_pages([
+                partial(_draw_medal_stats_page, view, chunk, index + 1, len(chunks))
+                for index, chunk in enumerate(chunks)
+            ])
         except RuntimeError as exc:
             if not is_height_limit_error(exc):
                 raise
@@ -1459,16 +1461,21 @@ async def draw_medal_missing_card(view: MedalMissingView) -> tuple[bytes, ...]:
         if budget >= len(entries):
             continue
         chunks = [entries[i:i + budget] for i in range(0, len(entries), budget)]
-        pages: list[bytes] = []
+        page_views = [
+            replace(view, **{
+                key: [medal for group, medal in chunk if group == key]
+                for key in group_keys
+            })
+            for chunk in chunks
+        ]
         try:
-            for index, chunk in enumerate(chunks):
-                page_view = replace(view, **{
-                    key: [medal for group, medal in chunk if group == key]
-                    for key in group_keys
-                })
-                pages.append(await _draw_medal_missing_page(
+            pages = await render_pages([
+                partial(
+                    _draw_medal_missing_page,
                     page_view, icon_map, page_number=index + 1, page_count=len(chunks),
-                ))
+                )
+                for index, page_view in enumerate(page_views)
+            ])
         except RuntimeError as exc:
             if not is_height_limit_error(exc):
                 raise
@@ -1847,10 +1854,11 @@ async def draw_archive_stats_card(view: ArchiveDiffView) -> tuple[bytes, ...]:
     last_error: RuntimeError | None = None
     for budget in ARCHIVE_PAGE_BUDGETS:
         chunks = [new_items[i:i + budget] for i in range(0, len(new_items), budget)]
-        pages: list[bytes] = []
         try:
-            for index, chunk in enumerate(chunks):
-                pages.append(await _draw_archive_stats_page(view, chunk, index + 1, len(chunks), icon_map, len(new_items)))
+            pages = await render_pages([
+                partial(_draw_archive_stats_page, view, chunk, index + 1, len(chunks), icon_map, len(new_items))
+                for index, chunk in enumerate(chunks)
+            ])
         except RuntimeError as exc:
             if not is_height_limit_error(exc):
                 raise

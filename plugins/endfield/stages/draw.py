@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import html
 from collections.abc import Mapping
+from functools import partial
 from time import perf_counter
 
 from loguru import logger
 
 from otae_bot.infrastructure.rendering.executor import run_image_render
-from otae_bot.infrastructure.rendering.browser import BrowserResource, screenshot_web_element
+from otae_bot.infrastructure.rendering.browser import BrowserResource, screenshot_timing, screenshot_web_element
+from otae_bot.infrastructure.rendering.pages import render_pages
 from otae_bot.infrastructure.rendering.temp_files import schedule_temp_file_cleanup
 
 from ..cold_start import REMOTE_ASSET_NAMESPACE, note_remote_assets
@@ -103,7 +105,7 @@ async def draw_stage_catalog_cards(view: StageCatalogView) -> tuple[bytes, ...]:
     for item_budget in STAGE_CATALOG_PAGE_BUDGETS:
         pages = _paginate_catalog(view, item_budget)
         try:
-            rendered = [await draw_stage_catalog_card(page) for page in pages]
+            rendered = await render_pages([partial(draw_stage_catalog_card, page) for page in pages])
         except RuntimeError as exc:
             if not is_height_limit_error(exc):
                 raise
@@ -185,23 +187,24 @@ async def _draw_stage_html(
     html_path = _write_temp_html(document)
     started = perf_counter()
     try:
-        output = await screenshot_web_element(
-            html_path.resolve().as_uri(),
-            ".stage-card",
-            viewport=(STAGE_CARD_WIDTH, 1),
-            timeout_ms=25000,
-            max_height=STAGE_CARD_MAX_HEIGHT,
-            device_scale_factor=1.25,
-            settle_ms=40,
-            resources=resources,
-            wait_for_images=True,
-            strict_max_height=True,
-            overflow_selectors=overflow_selectors,
-        )
+        with screenshot_timing() as timing:
+            output = await screenshot_web_element(
+                html_path.resolve().as_uri(),
+                ".stage-card",
+                viewport=(STAGE_CARD_WIDTH, 1),
+                timeout_ms=25000,
+                max_height=STAGE_CARD_MAX_HEIGHT,
+                device_scale_factor=1.25,
+                settle_ms=40,
+                resources=resources,
+                wait_for_images=True,
+                strict_max_height=True,
+                overflow_selectors=overflow_selectors,
+            )
         optimized = await run_image_render(optimize_png_container, output)
         logger.info(
-            f"[endfield] draw kind={kind} total={perf_counter() - started:.3f}s "
-            f"bytes={len(output)}->{len(optimized)}"
+            f"[endfield] draw kind={kind} queue_wait={timing.queue_wait:.3f}s "
+            f"total={perf_counter() - started:.3f}s bytes={len(output)}->{len(optimized)}"
         )
         return optimized
     finally:
