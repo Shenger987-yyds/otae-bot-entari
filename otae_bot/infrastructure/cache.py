@@ -49,7 +49,13 @@ class _Flight(Generic[V]):
 
 
 class AsyncTTLCache(Generic[K, V]):
-    """Bounded in-memory cache that coalesces concurrent misses per key."""
+    """Bounded in-memory cache that coalesces concurrent misses per key.
+
+    ``max_entry_bytes`` caps a single value: larger values are still returned
+    and still coalesce while in flight, but are not stored (event
+    ``bypassed``). ``may_bypass`` limits that to values a slower tier (disk)
+    already holds; by default every oversized-per-entry value bypasses.
+    """
 
     def __init__(
         self,
@@ -61,10 +67,16 @@ class AsyncTTLCache(Generic[K, V]):
         clock: Callable[[], float] = time.monotonic,
         on_event: Callable[[K, str, float], None] | None = None,
         ttl_for_value: Callable[[V], float] | None = None,
+        max_entry_bytes: int | None = None,
+        may_bypass: Callable[[V], bool] | None = None,
     ):
         self.ttl_seconds = max(0.0, float(ttl_seconds))
         self.max_bytes = max(0, int(max_bytes))
         self.max_entries = max(1, int(max_entries))
+        self.max_entry_bytes = (
+            None if max_entry_bytes is None else max(0, int(max_entry_bytes))
+        )
+        self._may_bypass = may_bypass
         self._sizeof = sizeof or (lambda _value: 1)
         self._clock = clock
         self._entries: OrderedDict[K, _CacheEntry[V]] = OrderedDict()
@@ -99,6 +111,35 @@ class AsyncTTLCache(Generic[K, V]):
         with self._lock:
             entry = self._entries.get(key)
             return entry is not None and entry.expires_at > now
+
+    def peek(self, key: K) -> V | None:
+        """The stored, unexpired value (counted as a direct hit), or None.
+
+        Never starts or joins a fill; an in-flight value is not returned.
+        """
+        now = self._clock()
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None or entry.expires_at <= now:
+                return None
+            self._entries.move_to_end(key)
+            self._hits += 1
+            self._event(key, "direct_hits")
+            return entry.value
+
+    def put(self, key: K, value: V, *, ttl_seconds: float | None = None) -> bool:
+        """Publish a value obtained elsewhere (e.g. a batched disk read).
+
+        Same admission rules as a completed fill. In-flight fills for ``key``
+        are left alone: whichever finishes last wins.
+        """
+        ttl = self.ttl_seconds if ttl_seconds is None else max(0.0, float(ttl_seconds))
+        if self._ttl_for_value is not None:
+            ttl = min(ttl, self._ttl_for_value(value))
+        if ttl <= 0:
+            return False
+        with self._lock:
+            return self._store(key, value, ttl)
 
     async def get_or_create(
         self,
@@ -179,17 +220,7 @@ class AsyncTTLCache(Generic[K, V]):
             with self._lock:
                 if self._inflight.get(key) is not flight or ttl <= 0:
                     return value
-                size = max(0, int(self._sizeof(value)))
-                if self.max_bytes and size > self.max_bytes:
-                    self._oversized += 1
-                    self._event(key, "oversized")
-                    return value
-                previous = self._entries.pop(key, None)
-                if previous is not None:
-                    self._bytes -= previous.size
-                self._entries[key] = _CacheEntry(value, self._clock() + ttl, size)
-                self._bytes += size
-                self._evict_to_limits()
+                self._store(key, value, ttl)
             return value
         except BaseException:
             with self._lock:
@@ -203,6 +234,28 @@ class AsyncTTLCache(Generic[K, V]):
                 self._event(key, "fill_seconds", elapsed)
                 if self._inflight.get(key) is flight:
                     self._inflight.pop(key, None)
+
+    def _store(self, key: K, value: V, ttl: float) -> bool:
+        """Insert under ``_lock``; False when the value is not admitted."""
+        size = max(0, int(self._sizeof(value)))
+        if (
+            self.max_entry_bytes is not None
+            and size > self.max_entry_bytes
+            and (self._may_bypass is None or self._may_bypass(value))
+        ):
+            self._event(key, "bypassed")
+            return False
+        if self.max_bytes and size > self.max_bytes:
+            self._oversized += 1
+            self._event(key, "oversized")
+            return False
+        previous = self._entries.pop(key, None)
+        if previous is not None:
+            self._bytes -= previous.size
+        self._entries[key] = _CacheEntry(value, self._clock() + ttl, size)
+        self._bytes += size
+        self._evict_to_limits()
+        return True
 
     def _task_done(self, task: asyncio.Task[V]) -> None:
         with self._lock:
