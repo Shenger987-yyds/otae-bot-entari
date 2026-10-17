@@ -1,6 +1,6 @@
 # 缓存与请求体系改造方案：以查询响应延迟为主矛盾
 
-状态：实施中·第二期（分支 `feat/cache-request-phase2`）。第一期已合入 `main @ ef3ec25`（v1.28.0）并上线沈阳云；第三、四期未开始。基线 `main @ ef3ec25`（v1.28.0）。
+状态：实施中·第三期（分支 `feat/cache-request-phase3`，基线 `main @ 0c506de`，v1.29.0）。第一期已合入 `main @ ef3ec25`（v1.28.0）并上线沈阳云；第二期已合入 `main`（v1.29.0）；第四期未开始。
 
 ## 主人拍板（已定，实施须遵守）
 
@@ -75,6 +75,64 @@
 - `check_endfield_public_cache.py`（图片与 `--table`）仍是 200 → 0 次 → 304。
 - em 上待核：§7.2 的日志（`net_304`、`soft_hit`、`refill done/abandoned`、`prefetch source=`）与
   `/ef dev status` 的「素材队列」行；账号卡基准仍需凭据，未在本机跑。
+
+## 第三期落地记录
+
+§5 第三期六项在 `feat/cache-request-phase3` 完成（v1.30.0，未推送、未上线）。按主人拍板 **Q3C**
+实施，**不是**正文 §4.3 / §5 写的默认方案 B（2 个 sync worker 线程、各一个浏览器、`_get_browser()`
+thread-local）：`otae_bot/infrastructure/rendering/browser.py` 改用 Playwright async API，一个浏览器、
+多个 context 并发。与方案 / brief 的出入：
+
+- **async Playwright 跑在专用线程的专用事件循环上**，不在 entari 主循环上：Playwright 对象绑定创建它的
+  循环，而测试与脚本会从不同的 `asyncio.run` 截图、关浏览器；em（Windows）上驱动子进程只能在 Proactor
+  循环里起，这个线程显式建 `ProactorEventLoop`，不看进程的 loop policy。调用方经
+  `run_coroutine_threadsafe` + `wrap_future` 提交，调用方取消会传到浏览器循环上的任务。浏览器仍是进程级
+  单例，任何循环都能用、都能关，关掉后下一次截图自动重启。
+- **渲染槽位就是优先级队列**：`OTAE_BROWSER_CONCURRENCY`（默认 2，1–4），交互 > 后台，同级先到先得；
+  `screenshot_web_element` / `evaluate_web_page` 末尾加仅关键字参数 `priority`，现有调用方都不传（全是
+  交互）。`queue_wait` 改为「提交 → 拿到槽位」，`[browser] queue_wait=` 告警阈值仍 1 s；关卡、百科、两种
+  日历的 `draw kind=` 行与抽卡 v3 的汇总行补上 `queue_wait=`（抽卡是各页累计）。`/ef dev status` 加一行
+  「浏览器: 在途 / 排队 交互 后台 / 并发 / context」。
+- **context 按 device scale factor 分池复用**（dsf 建 context 时就定死，viewport 可以逐页改）：每次截图新开
+  page，先 `set_viewport_size` 再 `goto`，用完只关 page。池里总数不超过并发数，换 dsf 时关掉最久没用的空闲
+  context。超时、崩溃、被取消的 context 关掉不放回；高度超限与版面溢出这两种「页面正常给了答案」的
+  `RuntimeError` 保留 context；用满 200 次换新；浏览器断开时整池丢弃并重启驱动，启动失败不留驱动进程。
+- **路由收窄只对本地页面**：`file:` / `data:` 页面按 `resources` 的目录各注册一条字符串 glob（实际不超过
+  4 条：`endfield.local/assets`、`endfield-account.local/{assets,fonts,ui}`、帮助图字体目录），由 Playwright
+  驱动端匹配，其余请求不再回 Python；没有 resources 的页面不注册路由。brief 默认所有页面都是本地卡片，
+  但 McWiki 截图与 `WebImageBuilders` 打开的是线上网页，它们**保留原来的 `**/*` 路由**（继续跳过字体与
+  媒体），免得线上页开始加载视频与外链字体。路径里的 glob 元字符会转义。
+- **分页并行**：新增 `rendering/pages.py::render_pages`（按页序返回；第一个失败的页取消其余页并原样抛出，
+  不包 `ExceptionGroup`，调用方 `is_height_limit_error` 的重试照旧）。brief 的五处必做（账号详情、探索、
+  抽卡 v3、影拓丰碑历史、回响历史）与顺带的关卡目录、百科目录、奖章统计、缺章、档案统计都已改；v1 抽卡
+  回退路径不动。同一档预算的各页现在同时渲染，所以某档超高时那一档的每页都会画一次（串行时第一页超高
+  就停）；四个按 `side_effect` 列表数调用的分页测试改成按页内容判定超高，回响历史的「串行」断言改为「并行」。
+- `scripts/preview_endfield_exploration.py` 改用同步的 `_launch_candidates` 自己起 sync 浏览器。Playwright
+  版本约束不动：`setNetworkInterceptionPatterns` 1.37 起才在驱动端过滤，更老的版本 pattern 照样对，只是
+  省不掉往返。
+
+本地验证（开发机 Linux / Python 3.12 / playwright 1.62，不是 em）：
+
+- 像素：同一批输入在 `main @ 0c506de`（旧 sync 实现）与本分支各渲染一次：干员（dsf 2）、武器、关卡详情
+  与目录（1.25）、挑战空页（CDP 截图）、账号总览（多前缀 resources）、帮助图（`file://` 字体），7 张 PNG
+  的 SHA-256 全部相同；`check_endfield_visual_baseline.py` 两边输出逐字节相同；`test_endfield_visual.py`
+  基准一位没改。
+- 渲染层争用（6 张不同的卡同时出图，外加一张 7 页的关卡目录；素材用本地假图；各 5 轮取中位数）：
+  旧实现整批 5.17 s、最长 `queue_wait` 2.14 s、7 页 3.35 s；并发 2 为 4.17–4.34 s、1.51–1.59 s、2.56 s；
+  并发 1 为 4.98–5.16 s、2.13 s、3.27 s（与旧实现持平）；并发 4 为 4.04 s、1.30 s、2.23 s。6 张卡占槽的
+  总时长只有约 2.1 s，其余是 HTML 与素材准备、PNG 重封装（主循环与 2 线程图像池），不在本期范围，所以
+  并发再往上加收益递减。
+- `benchmark_endfield_queries.py --cases mixed`（live 录一次，两边 replay 同一份 cassette）：四并发整批
+  中位数 2.60 → 2.54 s，基本没变。这组里配装卡与关卡目录的两次截图本来就不重叠（旧实现 `queue_wait=0.000`），
+  方案说的「四并发整批时间下降」在这组用例上测不出来，渲染争用的变化看上一条。
+- 全量 `pytest -q`：2378 passed / 2 skipped（加 changelog 条目后）；新增 `tests/test_browser_render_queue.py` 16 例（优先级、两槽并发、
+  按 dsf 复用与上限、异常与用满回收、排队中与运行中取消、跨循环关闭与重启、关闭超时取消、启动失败不留
+  驱动、断线重启、分页顺序与失败传播、路由前缀与转义、路由分流、并发配置、Windows 用 Proactor），与重写的
+  `test_browser_queue_timing.py` 3 例连跑 15 次无失败；`test_endfield_visual.py` 加一例真 Chromium 并发
+  渲染四种 dsf、尺寸各自正确。
+- em 上待核：上线前单独跑一次渲染脚本，确认 Windows / Python 3.13 上 Proactor 线程能起驱动；4 人同时查时
+  `draw kind=... queue_wait=` ≤ 1 s；`/ef dev status` 浏览器行；Chromium 进程数为 1 个主进程加不超过并发数个
+  renderer。
 
 
 主人原话：「目前的缓存体系需要大改，请求体系也要改」「目前主要问题是各种查询的响应过慢」。
@@ -337,6 +395,9 @@ hycdn 经代理时不预取（Q4）。
 
 #### 浏览器与渲染队列
 
+> 本节的「N 个 sync worker 线程、各自一个浏览器」是 Q3 的默认建议 B，已被主人拍板的 Q3C 取代：实际做法是
+> async Playwright、一个浏览器多 context 并发，见「第三期落地记录」。
+
 - `rendering/browser.py` 改为 **N 个 worker 线程（默认 2），各自持有一个 `sync_playwright` 实例与浏览器**，
   前面加一个优先级队列（交互 > 后台），记录 `queue_wait` 并写进 `draw kind=` 日志。
   单线程的现状下任何一张慢卡都让全体排队，这是 P95 最直接的改善点。
@@ -424,6 +485,9 @@ python scripts/benchmark_endfield_queries.py --mode live --cases operator_card,l
 ### 第三期：渲染（浏览器 worker 池与队列）
 
 增量：worker 池（默认 2）、优先级队列、context 复用、路由前缀收窄、分页卡多页并行、`queue_wait` 指标。
+
+（按 Q3C 实施，下面「两个 Chromium」「thread-local」是方案 B 的风险，已不适用；实际是一个浏览器多 context，
+并发 2 的峰值约 +300 MB，见「第三期落地记录」。）
 
 风险：两个 Chromium 的内存（em 上约 +300 MB）；sync Playwright 每线程一个实例的线程安全要靠「线程私有」保证，
 `_get_browser()` 改为 thread-local。帮助图、B 站卡、雷达卡等其他插件共用这一层，需要跑它们的渲染测试
