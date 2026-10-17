@@ -29,6 +29,28 @@ def bvid_from_card(card: BiliCard) -> str:
     return ""
 
 
+def _opus_text(major: dict[str, Any]) -> str:
+    """Opus 的正文不在 desc 里，只在 major.opus.summary。"""
+    summary = (major.get("opus") or {}).get("summary") or {}
+    text = str(summary.get("text") or "")
+    if text:
+        return text
+    return "".join(
+        str(node.get("text") or node.get("orig_text") or "")
+        for node in summary.get("rich_text_nodes") or []
+    )
+
+
+def _forward_text(item: dict[str, Any]) -> str:
+    orig = item.get("orig") or {}
+    if not isinstance(orig, dict):
+        return ""
+    dynamic = (orig.get("modules") or {}).get("module_dynamic") or {}
+    major = dynamic.get("major") or {}
+    text = _opus_text(major) if major.get("type") == "MAJOR_TYPE_OPUS" else ""
+    return text or str((dynamic.get("desc") or {}).get("text") or "")
+
+
 def dynamic_item_to_card(item: dict[str, Any], uid: str) -> BiliCard:
     """Map one dynamic feed entry to a card (public form of the old private helper)."""
     modules = item.get("modules") or {}
@@ -77,6 +99,10 @@ def dynamic_item_to_card(item: dict[str, Any], uid: str) -> BiliCard:
                 desc.get("rich_text_nodes") or summary.get("rich_text_nodes") or []
             )
         )
+    if item.get("type") == "DYNAMIC_TYPE_FORWARD":
+        forwarded = _forward_text(item)
+        if forwarded:
+            text = f"{text}\n\n// 转发：{forwarded}" if text else f"// 转发：{forwarded}"
     if text and title == "发布了新动态":
         title = text.splitlines()[0][:40] or title
     if url.startswith("//"):

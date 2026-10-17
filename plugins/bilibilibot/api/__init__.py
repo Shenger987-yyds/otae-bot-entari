@@ -6,10 +6,13 @@ one concern and only `session` touches the network directly.
 
 from __future__ import annotations
 
+import json
 import time
 from typing import Any
 
 import httpx
+
+from otae_bot.infrastructure.cache import AsyncTTLCache
 
 from ..models import (
     BiliCard,
@@ -72,6 +75,15 @@ class BiliApi:
             if value
         }
         self.rsshub_base_urls = rsshub_api.merge_base_urls(rsshub_base_urls)
+        # 官号动态详情按 ID 缓存：RSS 只给列表，正文要逐条回查 detail 接口。
+        self._dynamic_details: AsyncTTLCache[str, dict[str, Any]] = AsyncTTLCache(
+            ttl_seconds=300,
+            max_entries=64,
+            max_bytes=4 * 1024 * 1024,
+            sizeof=lambda item: len(
+                json.dumps(item, ensure_ascii=False).encode("utf-8")
+            ),
+        )
         # Transport, cookies, WBI keys and risk-control live in the session.
         self.session = BiliSession(
             timeout=timeout,
@@ -84,6 +96,7 @@ class BiliApi:
     # --- session passthrough -------------------------------------------------
 
     async def aclose(self) -> None:
+        await self._dynamic_details.close()
         await self.session.aclose()
 
     @property
@@ -376,6 +389,16 @@ class BiliApi:
     ) -> list[dict[str, Any]]:
         return await space_api.dynamic_items(self, uid, deadline=deadline)
 
+    async def official_dynamic_detail(
+        self, item_id: str, *, deadline: float | None = None
+    ) -> dict[str, Any]:
+        return await self._dynamic_details.get_or_create(
+            item_id,
+            lambda: space_api.official_dynamic_detail(
+                self, item_id, deadline=deadline
+            ),
+        )
+
     def _bvid_from_card(self, card: BiliCard) -> str:
         return space_api.bvid_from_card(card)
 
@@ -390,6 +413,26 @@ class BiliApi:
         return await space_api.within(label, deadline, awaitable_factory)
 
     # --- RSSHub -------------------------------------------------------------
+
+    async def rsshub_items(
+        self, route: str, *, deadline: float | None = None
+    ) -> list[dict[str, Any]]:
+        """一页多条：RSS 只用来发现动态 ID，正文仍回查官方 detail 接口。"""
+
+        async def fetch(base_url: str, route: str, *, deadline: float | None = None):
+            return await rsshub_api.fetch_first_item(
+                self.session,
+                base_url,
+                route,
+                timeout=self.timeout,
+                deadline=deadline,
+                all_items=True,
+            )
+
+        result = await rsshub_api.first_item(
+            fetch, self.rsshub_base_urls, route, deadline=deadline
+        )
+        return result["feed_items"]
 
     async def rsshub_first_item(
         self, route: str, *, deadline: float | None = None
