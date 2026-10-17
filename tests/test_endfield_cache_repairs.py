@@ -676,6 +676,7 @@ class AccountPageCacheTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(cache.ttl_seconds, endfield.RENDER_CACHE_TTL_SECONDS)
         # Raw personal API data keeps its short window.
         self.assertEqual(endfield._CHALLENGE_DATA_CACHE.ttl_seconds, 60)
+        self.assertEqual(endfield._CARD_DETAIL_CACHE.ttl_seconds, 60)
 
     async def test_render_log_splits_data_assets_and_drawing(self):
         async def render():

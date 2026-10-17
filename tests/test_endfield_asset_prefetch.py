@@ -99,6 +99,9 @@ class DetailAssetUrlTests(unittest.TestCase):
 
 
 class CardDetailSnapshotTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        await handlers._CARD_DETAIL_CACHE.clear()
+
     async def test_snapshot_is_written_in_the_background_and_assets_are_prefetched(self):
         role = SimpleNamespace(role_id="r1", server_id="1")
         detail = _detail()
@@ -135,6 +138,8 @@ class CardDetailSnapshotTests(unittest.IsolatedAsyncioTestCase):
         ):
             await handlers._card_detail_with_snapshot("token", role)
             await asyncio.sleep(0.01)  # the failing write ran and was swallowed
+        # A reused detail writes no snapshot; start the second round from a real fetch.
+        await handlers._CARD_DETAIL_CACHE.clear()
         with (
             patch.object(handlers.official_client, "card_detail", AsyncMock(return_value={})),
             patch.object(handlers.ownership_stats_service, "persist_detail", side_effect=never),

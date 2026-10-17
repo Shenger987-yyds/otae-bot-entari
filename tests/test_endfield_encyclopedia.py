@@ -660,7 +660,32 @@ class EndfieldEncyclopediaEnemyTests(unittest.IsolatedAsyncioTestCase):
         view = await encyclopedia_enemies.build_enemy_view(self.data, ENEMY_SHIELD)
         self.assertEqual(view.resistance_template_count, 2)
         self.assertEqual(view.resistances, ())
+        # 多个属性模板时同样不给单一数值，避免把其中一个模板的值当全卡口径。
+        self.assertEqual(view.stats, ())
+        self.assertEqual(view.stat_node_count, 0)
         self.assertEqual(view.variant_count, 2)
+
+    async def test_level_nodes_carry_hp_attack_defense(self):
+        view = await encyclopedia_enemies.build_enemy_view(self.data, ENEMY_PROBE)
+        self.assertEqual(
+            [(stat.level, stat.hp, stat.attack, stat.defense) for stat in view.stats],
+            [(1, 692, 56, 100), (2, 790, 64, 100)],
+        )
+        self.assertEqual(view.stat_node_count, 2)
+        self.assertEqual(view.poise, 20)
+        self.assertEqual(view.tower_attack, 10.0)
+
+    async def test_level_nodes_are_sampled_down_to_the_card_limit(self):
+        attributes = {
+            "levelDependentAttributes": [
+                {"attrs": [{"attrType": 0, "attrValue": level}, {"attrType": 1, "attrValue": level * 100}]}
+                for level in range(1, 13)
+            ]
+        }
+        stats, total = encyclopedia_enemies._stats(attributes)
+        self.assertEqual(total, 12)
+        self.assertEqual([stat.level for stat in stats], [1, 3, 5, 8, 10, 12])
+        self.assertEqual(stats[0].hp, 100)
 
     async def test_nameless_ability_keeps_its_description(self):
         view = await encyclopedia_enemies.build_enemy_view(self.data, ENEMY_SHIELD)

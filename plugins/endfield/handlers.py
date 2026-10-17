@@ -74,6 +74,7 @@ from .account.client import (
     CURRENCY_TYPES,
     EndfieldAPIError,
     EndfieldOfficialClient,
+    account_credential_fingerprint,
     encode_account_credential,
     decode_account_credential,
     is_asia_role,
@@ -272,11 +273,12 @@ FORWARD_MAX_NODES = 50                  # 单条合并转发的节点上限，�
 _GACHA_FORWARD_SENDER_NAME = "终末地抽卡分析"
 # 成品图缓存（资料卡、配装、账号页、挑战页）。key 已含视图内容 digest、渲染版本
 # （账号页 / 挑战页还含素材代次），内容一变 key 就变；TTL 只决定同一结果能复用多久。
-# 素材代次变化或 /ef dev clear 时整体失效。个人原始数据不在这里缓存。
+# 素材代次变化或 /ef dev clear 时整体失效。个人原始数据只在 _CARD_DETAIL_CACHE（60 秒，
+# key 含凭据指纹）与 _CHALLENGE_DATA_CACHE（60 秒）里短暂复用，不落盘。
 RENDER_CACHE_TTL_SECONDS = 30 * 60.0
 CARD_CACHE_TTL_SECONDS = RENDER_CACHE_TTL_SECONDS
 CARD_CACHE_MAX_BYTES = 48 * 1024 * 1024
-CARD_RENDER_VERSION = "endfield-card-v55"
+CARD_RENDER_VERSION = "endfield-card-v58"
 CardCacheKey = tuple[str, str, str, str, str, str, str]
 _CARD_CACHE: AsyncTTLCache[CardCacheKey, tuple[bytes, ...]] = AsyncTTLCache(
     ttl_seconds=CARD_CACHE_TTL_SECONDS,
@@ -313,6 +315,19 @@ _CHALLENGE_RENDER_CACHE: AsyncTTLCache[ChallengeCacheKey, tuple[bytes, ...]] = A
     max_bytes=48 * 1024 * 1024,
     max_entries=64,
     sizeof=lambda pages: sum(len(page) for page in pages),
+)
+# 同一凭据同一角色的 card/detail 60 秒内复用（账号 / 基建 / 养成 / 探索 / 日常连查），
+# 仅进程内存。key 是（凭据指纹, role_id, server_id），不含 token 原文；不挂 on_event，
+# 免得 key 流进任何回调。
+CARD_DETAIL_CACHE_TTL_SECONDS = 60.0
+CardDetailCacheKey = tuple[str, str, str]
+_CARD_DETAIL_CACHE: AsyncTTLCache[CardDetailCacheKey, dict] = AsyncTTLCache(
+    ttl_seconds=CARD_DETAIL_CACHE_TTL_SECONDS,
+    max_bytes=16 * 1024 * 1024,
+    max_entries=64,
+    sizeof=lambda detail: len(
+        json.dumps(detail, ensure_ascii=False, separators=(",", ":"), default=str)
+    ),
 )
 
 Resolver = Callable[..., Awaitable[list[EndfieldCandidate]]]
@@ -921,6 +936,8 @@ async def _handle_personal_command(matcher, event: Event, command: ParsedEndfiel
             )
         if command.action == "unbind":
             role = account_store.unbind(qq_user_id, command.account_selector)
+            if role is not None:
+                await _forget_card_detail(role)
             return await matcher.finish(
                 f"已解除绑定角色：{role.nickname}（{role.role_id}）。" if role else "未找到指定账号，发送 /ef 账号 可查看有效编号。"
             )
@@ -1706,9 +1723,31 @@ async def _persist_detail_quietly(role: EndfieldRole, detail: dict) -> None:
         pass
 
 
+async def _fetch_card_detail(token: str, role: EndfieldRole) -> tuple[dict, bool]:
+    """card/detail through the 60 s cache; True when no new request was made.
+
+    Concurrent queries for one role share a single request. The role lock is
+    taken only when the API is actually called, so a hit never blocks on it.
+    """
+    key = (account_credential_fingerprint(token), str(role.role_id), str(role.server_id))
+
+    async def request() -> dict:
+        async with ROLE_TASKS.claim(role):
+            return await official_client.card_detail(token, role)
+
+    return await _CARD_DETAIL_CACHE.get_or_create_with_status(key, request)
+
+
+async def _forget_card_detail(role: EndfieldRole) -> int:
+    target = (str(role.role_id), str(role.server_id))
+    return await _CARD_DETAIL_CACHE.clear(lambda key: key[1:] == target)
+
+
 async def _card_detail_with_snapshot(token: str, role: EndfieldRole) -> dict:
-    async with ROLE_TASKS.claim(role):
-        detail = await official_client.card_detail(token, role)
+    detail, reused = await _fetch_card_detail(token, role)
+    if reused:
+        # 同一份 detail 的快照与预取在第一次取到时已经做过。
+        return detail
     # 持有率快照在后台写，不挡视图构建；素材 URL 此刻已知，先在后台把图预取到磁盘，
     # 与名称表加载、视图构建重叠。
     _spawn_background(_persist_detail_quietly(role, detail))
@@ -2259,12 +2298,12 @@ async def _handle_daily(
 
     async def load(role: EndfieldRole) -> DailyAccountView:
         try:
-            async with ROLE_TASKS.claim(role):
-                token = account_store.decrypt_token(role, cipher)
-                # card_detail 返回已解包的 data.detail；endfield_card_detail 是完整响应，
-                # 仅供奖章/档案等自行解包的视图使用。
-                detail = await official_client.card_detail(token, role)
-            prefetch_detail_assets(detail, source="daily")
+            token = account_store.decrypt_token(role, cipher)
+            # card_detail 返回已解包的 data.detail；endfield_card_detail 是完整响应，
+            # 仅供奖章/档案等自行解包的视图使用。与账号查询共用 60 秒缓存，没取新数据就不再预取。
+            detail, reused = await _fetch_card_detail(token, role)
+            if not reused:
+                prefetch_detail_assets(detail, source="daily")
             return build_daily_account_view(
                 detail,
                 nickname=role.nickname, uid=role.masked_uid,
@@ -3747,7 +3786,8 @@ def _normalize_cache_scope(value: str) -> str | None:
 
 async def _clear_endfield_caches(scope: str) -> int:
     global _ASSET_GENERATION
-    removed = 0
+    # 个人 card/detail 体积小，任何清缓存入口都顺带清掉。
+    removed = await _CARD_DETAIL_CACHE.clear()
     if scope in {"all", "icon", "operator", "weapon", "equipment", "stage"}:
         _ASSET_GENERATION += 1
         removed += await _ACCOUNT_PAGE_CACHE.clear()
@@ -3812,6 +3852,7 @@ async def _cache_status_lines() -> list[str]:
     card_stats = await _CARD_CACHE.stats()
     loadout_stats = await _LOADOUT_CACHE.stats()
     account_stats = await _ACCOUNT_PAGE_CACHE.stats()
+    detail_stats = await _CARD_DETAIL_CACHE.stats()
     diagnostics = await get_http_cache_diagnostics()
     return [
         _format_cache_stats("API", api_stats),
@@ -3820,8 +3861,10 @@ async def _cache_status_lines() -> list[str]:
         _format_cache_stats("成品卡片", card_stats),
         _format_cache_stats("配装卡片", loadout_stats),
         _format_cache_stats("账号卡片", account_stats),
+        _format_cache_stats("账号数据", detail_stats),
         _format_memory_pools(diagnostics),
         *_format_asset_queue(diagnostics.get("broker")),
+        _format_community_queue(official_client.community_context_metrics()),
         _format_browser_queue(browser_queue_snapshot()),
         f"缓存策略: 成品图 TTL {int(RENDER_CACHE_TTL_SECONDS)}s / 下载并发 8",
     ]
@@ -3833,6 +3876,20 @@ def _format_browser_queue(snapshot: dict) -> str:
     return (
         f"浏览器: 在途 {snapshot['inflight']} / 排队 交互 {waiting['interactive']} 后台 {waiting['background']} / "
         f"并发 {snapshot['concurrency']} / context {snapshot['contexts']}"
+    )
+
+
+def _format_community_queue(metrics: dict) -> str:
+    """Community credential exchanges and their queueing: counters and durations only."""
+    def seconds(key: str) -> str:
+        return f"{metrics.get(key, 0) / 1000:.1f}s"
+
+    return (
+        f"社区换签: 命中 {metrics.get('cache_hits', 0)} / 换签 {metrics.get('exchange_attempts', 0)}"
+        f"（失败 {metrics.get('exchange_failed', 0)}，熔断拒绝 {metrics.get('circuit_rejections', 0)}）/ "
+        f"等待锁 {metrics.get('lock_waits', 0)} 次 共 {seconds('lock_wait_ms')} / "
+        f"等待间隔 {metrics.get('interval_waits', 0)} 次 共 {seconds('interval_wait_ms')} / "
+        f"换签耗时 {seconds('exchange_ms')}"
     )
 
 
@@ -4066,7 +4123,7 @@ async def _close_ownership_startup_task() -> None:
         cache.close() for cache in (
             _CARD_CACHE, _LOADOUT_CACHE, _CALENDAR_CACHE,
             _CHALLENGE_DATA_CACHE, _CHALLENGE_RENDER_CACHE, service._weapon_relations, service._ake_views,
-            _ACCOUNT_PAGE_CACHE,
+            _ACCOUNT_PAGE_CACHE, _CARD_DETAIL_CACHE,
         )
     ))
     await official_client.close()

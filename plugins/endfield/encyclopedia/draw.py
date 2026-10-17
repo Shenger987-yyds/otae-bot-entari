@@ -1,5 +1,8 @@
 """图鉴卡渲染：物品、道具、敌人、词条、档案条目，以及四种目录。
 
+版式语言与干员数据详表同源：浅色方格底、细描边面板、黄色（按 kind 换色）
+编号段头、等宽字编号，读数像一张技术档案而不是一张网页。
+
 截图参数与干员卡同源（`_prepare_assets` + `_write_temp_html` + `screenshot_web_element`）：
 缺图走 `_prepare_assets` 的 missing 记录，从而进 `_IncompletePages`，不写成品缓存。
 
@@ -39,14 +42,31 @@ from .models import (
     TermView,
 )
 
+# 版心不写死：卡片按内容撑开，只留上下限。
 CARD_WIDTH = 1240
+CARD_MIN_WIDTH = 640
 CARD_MAX_HEIGHT = 12000
 # 与 ARCHIVE_PAGE_BUDGETS 同数值，故意不 import。
 CATALOG_PAGE_BUDGETS: tuple[int, ...] = (24, 18, 12, 6)
 CATALOG_COLUMNS = 6
+_PAGE_PADDING = 26
 
 _OVERFLOW_SELECTORS = (".ency-section", ".entry", ".catalog-item", ".ability", ".resist-cell")
 _CATALOG_OVERFLOW_SELECTORS = (".catalog-group", ".catalog-item")
+
+# 稀有度配色与 `account/detail/draw.py` 的 `_RARITY_COLORS` 同源。
+_RARITY_COLORS = {6: "#ff3c2e", 5: "#e59a18", 4: "#8a56d6", 3: "#2d82c9", 2: "#4f9a52", 1: "#8d9598"}
+_RARITY_FALLBACK = "#c9cec8"
+
+# (强调色, 英文名, 中文名)
+_THEMES: dict[str, tuple[str, str, str]] = {
+    "item": ("#f2c500", "ITEM", "物品"),
+    "prop": ("#21c6d0", "PROP", "道具"),
+    "enemy": ("#ff623d", "ENEMY", "敌人"),
+    "term": ("#8a56d6", "TERM", "词条"),
+    "archive_entry": ("#286cd6", "ARCHIVE", "档案"),
+    "catalog": ("#f2c500", "CODEX", "目录"),
+}
 
 # 效果句里的 <@ba.x>…</> 与 <#ba.x>…</>；与 render_weapon_rich_text 同一形状。
 # 不直接调那个函数：它要 WeaponView，还会把没替换掉的 {key} 画成强调文本。
@@ -120,144 +140,250 @@ async def draw_catalog_cards(view: EncyclopediaCatalogView) -> tuple[bytes, ...]
 # ------------------------------------------------------------------ HTML 片段
 
 def render_item_html(view: ItemView, urls: Mapping[str, str]) -> str:
-    facts = [
-        ("类型", view.type_name),
-        ("稀有度", str(view.rarity) if view.rarity else ""),
-    ]
+    accent, kind_en, kind_cn = _THEMES["item"]
+    facts = _spec(
+        [
+            ("类型", view.type_name),
+            ("稀有度", str(view.rarity) if view.rarity else ""),
+            ("获取途径", _count_meta(view.obtain_ways, "条")),
+        ]
+    )
+    description = _rich_paragraph(view.description)
+    if str(view.deco_description or "").strip():
+        description += f"<p class='deco'>{_rich(view.deco_description, {})}</p>"
     sections = [
-        _section("物品说明", _paragraph(view.description)),
-        _section("获取途径", _chips(view.obtain_ways, empty=view.no_obtain_hint)),
+        ("物品说明", description),
+        ("获取途径", _chips(view.obtain_ways, empty=view.no_obtain_hint), _count_meta(view.obtain_ways, "条")),
     ]
     return _document(
         "item-card",
-        _hero("ITEM", view.name, view.item_id, urls.get(view.icon_url, ""), _fact_strip(facts)),
-        "".join(sections),
+        accent,
+        _hero(
+            kind_en=kind_en,
+            kind_cn=kind_cn,
+            title=view.name,
+            subtitle=view.item_id,
+            icon_url=urls.get(view.icon_url, ""),
+            facts=facts,
+        ),
+        _sections(sections),
         view.revision,
     )
 
 
 def render_prop_html(view: PropView, urls: Mapping[str, str]) -> str:
-    facts = [
-        ("类型", view.type_name),
-        ("分桶", view.bucket),
+    accent, kind_en, kind_cn = _THEMES["prop"]
+    facts = _spec(
+        [
+            ("类型", view.type_name),
+            ("稀有度", str(view.rarity) if view.rarity else ""),
+            ("分桶", "" if view.bucket == view.type_name else view.bucket),
+            ("效果", _count_meta(view.effect_lines)),
+        ]
+    )
+    params = [
         ("持续时间", _seconds(view.duration)),
         ("冷却", _seconds(view.cooldown)),
         ("施放", _seconds(view.cast_time)),
         ("装填", _count(view.charge_count)),
         ("回复上限", _count(view.recover_upper_count)),
+        ("持续生效", "是" if view.is_persistent else ""),
     ]
-    if view.is_persistent:
-        facts.append(("持续生效", "是"))
-    body = "".join(
-        f"<p class='effect'>{_rich(line, view.term_styles)}</p>" for line in view.effect_lines
+    params = [(label, value) for label, value in params if value]
+    effects = "".join(
+        f"<div class='effect'><i class='mark'></i><p>{_rich(line, view.term_styles)}</p></div>"
+        for line in view.effect_lines
     )
+    sections = [
+        ("使用效果", effects or "<p class='muted'>暂无效果文案</p>", _count_meta(view.effect_lines)),
+        ("施放参数", _spec_table(params), f"{len(params)} 项"),
+    ]
     return _document(
         "prop-card",
-        _hero("PROP", view.name, view.item_id, urls.get(view.icon_url, ""), _fact_strip(facts)),
-        _section("使用效果", body or "<p class='muted'>暂无效果文案</p>"),
+        accent,
+        _hero(
+            kind_en=kind_en,
+            kind_cn=kind_cn,
+            title=view.name,
+            subtitle=view.item_id,
+            icon_url=urls.get(view.icon_url, ""),
+            facts=facts,
+        ),
+        _sections(sections),
         view.revision,
     )
 
 
 def render_enemy_html(view: EnemyView, urls: Mapping[str, str]) -> str:
-    facts = [
-        ("类型", view.display_type_name),
-        ("实例", f"{view.variant_count} 个" if view.variant_count else ""),
-    ]
+    accent, kind_en, kind_cn = _THEMES["enemy"]
+    facts = _spec(
+        [
+            ("类型", view.display_type_name),
+            ("实例", f"{view.variant_count} 个" if view.variant_count else ""),
+            ("别名", view.nickname),
+            ("韧性", str(view.poise) if view.poise else ""),
+            ("对塔攻击", _number_text(view.tower_attack)),
+        ]
+    )
+    if view.stats:
+        rows = "".join(
+            "<div class='stat-row'>"
+            f"<b>Lv{stat.level}</b>"
+            f"<span>{_stat_number(stat.hp)}</span>"
+            f"<span>{_stat_number(stat.attack)}</span>"
+            f"<span>{_stat_number(stat.defense)}</span></div>"
+            for stat in view.stats
+        )
+        stats_body = (
+            "<div class='stat-table'><div class='stat-head'>"
+            "<span>等级</span><span>生命</span><span>攻击</span><span>防御</span></div>"
+            f"{rows}</div>"
+        )
+        stats_meta = (
+            f"{len(view.stats)} / {view.stat_node_count} 个节点"
+            if view.stat_node_count > len(view.stats)
+            else f"{view.stat_node_count} 个节点"
+        )
+    else:
+        # 没有唯一属性模板时整段省略：抗性段已经说明了「N 种属性模板」。
+        stats_body = ""
+        stats_meta = ""
     if view.resistances:
         resist = "<div class='resist-strip'>" + "".join(
-            "<div class='resist-cell' style='--el:#{color}'>".format(color=item.color or "8a9296")
-            + f"<span>{_escape(item.label)}</span><b>{_percent(item.percent)}</b></div>"
+            f"<div class='resist-cell' style='--el:#{item.color or '8a9296'}'>"
+            f"<div class='bar'></div><div class='cell-body'>"
+            f"<span>{_escape(item.label)}</span><b>{_percent(item.percent)}</b></div></div>"
             for item in view.resistances
         ) + "</div>"
+        resist_meta = f"{len(view.resistances)} 项"
     else:
         resist = (
             f"<p class='muted'>有 {view.resistance_template_count} 种属性模板，"
             "无法给出单一抗性。</p>"
         )
+        resist_meta = ""
     abilities = "".join(
         "<div class='ability'>"
-        + (f"<b>{_escape(item.name)}</b>" if item.name else "<b class='unnamed'>无名能力</b>")
-        + f"<p>{_multiline(item.description)}</p></div>"
-        for item in view.abilities
+        f"<b class='idx'>{index:02d}</b>"
+        + (f"<b class='name'>{_escape(item.name)}</b>" if item.name else "<b class='name unnamed'>无名能力</b>")
+        + f"<p>{_rich(item.description, {})}</p></div>"
+        for index, item in enumerate(view.abilities, start=1)
     )
     sections = [
-        _section("抗性", resist),
-        _section("能力", abilities or "<p class='muted'>暂无能力说明</p>"),
-        _section("出现区域", _chips(view.distributions, empty=f"{view.distribution_count} 个区域")),
-        _section("说明", _paragraph(view.description)),
+        *([("等级成长", stats_body, stats_meta)] if view.stats else []),
+        ("抗性", resist, resist_meta),
+        ("能力", abilities or "<p class='muted'>暂无能力说明</p>", _count_meta(view.abilities)),
+        (
+            "出现区域",
+            _chips(view.distributions, empty=f"{view.distribution_count} 个区域"),
+            _count_meta(view.distributions),
+        ),
+        ("说明", _rich_paragraph(view.description)),
     ]
     return _document(
         "enemy-card",
-        _hero("ENEMY", view.name or view.template_id, view.template_id, urls.get(view.icon_url, ""), _fact_strip(facts)),
-        "".join(sections),
+        accent,
+        _hero(
+            kind_en=kind_en,
+            kind_cn=kind_cn,
+            title=view.name or view.template_id,
+            subtitle=view.template_id,
+            icon_url=urls.get(view.icon_url, ""),
+            facts=facts,
+        ),
+        _sections(sections),
         view.revision,
     )
 
 
 def render_term_html(view: TermView, urls: Mapping[str, str]) -> str:
-    facts = [("族", view.family)]
+    accent, kind_en, kind_cn = _THEMES["term"]
+    if view.color:
+        accent = view.color if view.color.startswith("#") else f"#{view.color}"
+    facts = _spec([("族", view.family), ("关联", _count_meta(view.related, "个"))])
     related = "".join(f"<i>{_escape(item)}</i>" for item in view.related)
     sources = "".join(
-        "<div class='source'><b>{name}</b><span>{skill}</span></div>".format(
-            name=_escape(item.name), skill=_escape(item.skill)
-        )
-        for item in view.sources
+        "<div class='entry'>"
+        f"<b class='idx'>{index:02d}</b>"
+        f"<b>{_escape(item.name)}</b><span>{_escape(item.skill)}</span></div>"
+        for index, item in enumerate(view.sources, start=1)
     )
     if view.source_total > len(view.sources):
-        sources += f"<div class='source more'>还有 {view.source_total - len(view.sources)} 条来源</div>"
+        sources += f"<div class='entry-more'>还有 {view.source_total - len(view.sources)} 条来源</div>"
     sections = [
-        _section("说明", _paragraph(view.summary)),
-        _section("关联词条", f"<div class='chip-grid'>{related}</div>" if related else "<p class='muted'>无</p>"),
-        _section("来源", sources or "<p class='muted'>暂无来源</p>"),
+        ("说明", _rich_paragraph(view.summary)),
+        ("关联词条", f"<div class='chip-grid'>{related}</div>" if related else "<p class='muted'>无</p>", _count_meta(view.related)),
+        ("来源", sources or "<p class='muted'>暂无来源</p>", f"{view.source_total} 条" if view.source_total else ""),
     ]
     return _document(
         "term-card",
-        _hero("TERM", view.name, view.term_id, urls.get(view.icon_url, ""), _fact_strip(facts), accent=view.color),
-        "".join(sections),
+        accent,
+        _hero(
+            kind_en=kind_en,
+            kind_cn=kind_cn,
+            title=view.name,
+            subtitle=view.term_id,
+            icon_url=urls.get(view.icon_url, ""),
+            facts=facts,
+        ),
+        _sections(sections),
         view.revision,
     )
 
 
 def render_archive_entry_html(view: ArchiveEntryView, urls: Mapping[str, str]) -> str:
-    facts = [
-        ("页签", view.page_name),
-        ("分类", view.category_name),
-        ("组", view.group_name),
-        ("子组", view.group_sub_name),
-        ("版本", view.version),
+    accent, kind_en, kind_cn = _THEMES["archive_entry"]
+    facts = _spec([("版本", view.version)])
+    trail = [view.page_name, view.category_name, view.group_name, view.group_sub_name]
+    crumbs = "".join(
+        f"<i>{_escape(part)}</i>" for part in trail if str(part or "").strip()
+    )
+    sections = [
+        ("目录位置", f"<div class='trail'>{crumbs}</div>" if crumbs else "<p class='muted'>暂无目录信息</p>"),
+        ("档案条目", "<p class='muted'>条目正文来自游戏内档案，本卡只列出目录信息。</p>"),
     ]
     return _document(
         "archive-entry-card",
-        _hero("ARCHIVE", view.name or view.item_id, view.item_id, urls.get(view.icon_url, ""), _fact_strip(facts)),
-        _section("档案条目", "<p class='muted'>条目正文来自游戏内档案，本卡只列出目录信息。</p>"),
+        accent,
+        _hero(
+            kind_en=kind_en,
+            kind_cn=kind_cn,
+            title=view.name or view.item_id,
+            subtitle=view.item_id,
+            icon_url=urls.get(view.icon_url, ""),
+            facts=facts,
+        ),
+        _sections(sections),
         view.version,
     )
 
 
 def render_catalog_html(view: EncyclopediaCatalogView) -> str:
-    groups = "".join(
-        "<section class='catalog-group'>"
-        f"<div class='section-head'><h2>{_escape(group.name)}</h2><span>{group.count} 条</span></div>"
-        + (
-            f"<div class='catalog-grid'>{''.join(_catalog_item(item) for item in group.items)}</div>"
-            if group.items
-            else "<p class='muted'>发送该类型名可查看图标页。</p>"
-        )
-        + "</section>"
-        for group in view.groups
-    )
+    accent, kind_en, kind_cn = _THEMES.get(view.kind, _THEMES["catalog"])
+    if view.kind == "catalog":
+        kind_en, kind_cn = _THEMES["catalog"][1:]
     subtitle = f"{len(view.groups)} 个分组 · 共 {view.total} 条"
     if view.page_count > 1:
         subtitle += f" · 第 {view.page_number} / {view.page_count} 张"
+    hero = f"""
+    <header class="hero">
+      <div class="hero-main">
+        <div class="hero-kicker"><i class="kicker-mark"></i>ENDFIELD · CODEX<span class="kicker-tag">{_escape(kind_cn)}</span></div>
+        <h1>{_escape(view.title)}</h1>
+        <div class="hero-id">{_escape(subtitle)}</div>
+      </div>
+      <div class="hero-side">
+        <div class="count-block"><b>{view.total}</b><span>总条目</span></div>
+        {f'<div class="page-block"><b>{view.page_number}</b><span>/ {view.page_count}</span></div>' if view.page_count > 1 else ""}
+      </div>
+    </header>
+    <div class="hero-rule"></div>
+    """
     return _document(
         "catalog-card",
-        f"""
-        <header class="hero"><div class="hero-copy"><small>ENDFIELD / CODEX</small>
-        <h1>{_escape(view.title)}</h1><p>{_escape(subtitle)}</p></div>
-        <div class="hero-counts"><div class="hero-count"><b>{view.total}</b><span>总条目</span></div></div></header>
-        """,
-        groups or "<p class='muted'>暂无条目</p>",
+        accent,
+        hero,
+        _catalog_groups(view),
         view.revision,
     )
 
@@ -277,7 +403,7 @@ async def _render(
             output = await screenshot_web_element(
                 html_path.resolve().as_uri(),
                 ".ency-card",
-                viewport=(CARD_WIDTH, 1),
+                viewport=(CARD_MIN_WIDTH, 1),
                 timeout_ms=25000,
                 max_height=CARD_MAX_HEIGHT,
                 device_scale_factor=1.25,
@@ -345,82 +471,263 @@ def _paginate(
 
 # ------------------------------------------------------------------ HTML 工具
 
-def _document(klass: str, hero: str, body: str, revision: str) -> str:
-    return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><style>
-    *{{box-sizing:border-box}}html,body{{margin:0;width:{CARD_WIDTH}px;background:#dfe3e3;color:#171b1f;font-family:'Microsoft YaHei','PingFang SC','Noto Sans SC',Arial,sans-serif}}
-    .ency-card{{width:{CARD_WIDTH}px;min-height:520px;padding:28px;background:linear-gradient(90deg,rgba(23,27,31,.06) 1px,transparent 1px) 0 0/40px 40px,linear-gradient(0deg,rgba(23,27,31,.06) 1px,transparent 1px) 0 0/40px 40px,linear-gradient(135deg,#f8f9f6,#e4e8e9)}}
-    .hero{{display:flex;justify-content:space-between;align-items:center;gap:24px;min-height:140px;padding:22px 28px;border:1px solid #171b1f;border-bottom:9px solid var(--accent,#f2c500);background:#20262a;color:#fff}}
-    .hero-copy{{min-width:0}}.hero small{{color:var(--accent,#f2c500);font-size:13px;font-weight:900;letter-spacing:.22em}}
-    .hero h1{{margin:9px 0 0;font-size:46px;line-height:1.05;font-weight:950;overflow-wrap:anywhere}}
-    .hero p{{margin:9px 0 0;color:#cfd5d8;font-size:16px;font-weight:850;overflow-wrap:anywhere}}
-    .hero-side{{flex:none;display:flex;align-items:center;gap:18px}}
-    .hero-icon{{width:104px;height:104px;object-fit:contain;border:1px solid rgba(242,197,0,.5);background:rgba(255,255,255,.06);padding:6px}}
-    .hero-counts{{flex:none;display:flex;gap:26px;text-align:right}}.hero-count b{{display:block;font-size:48px;line-height:1;font-weight:950}}
-    .hero-count span{{color:#cfd5d8;font-size:14px;font-weight:850}}
-    .ency-section,.catalog-group{{margin-top:16px;padding:16px;border:1px solid #9aa2a5;background:rgba(248,249,247,.96)}}
-    .section-head{{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;margin-bottom:11px;padding-bottom:8px;border-bottom:4px solid #20262a}}
-    .section-head h2{{margin:0;font-size:24px}}.section-head span{{color:#697277;font-size:14px;font-weight:850}}
-    p{{margin:0;font-size:17px;line-height:1.55;font-weight:700;overflow-wrap:anywhere}}
-    p + p{{margin-top:7px}}.muted{{color:#7b8288;font-size:15px;font-weight:750}}
-    .effect{{padding:11px 14px;border-left:6px solid var(--accent,#f2c500);background:#fff}}
-    .effect + .effect{{margin-top:8px}}
-    .fact-strip{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:9px;margin-top:14px}}
-    .fact{{padding:10px 13px;border:1px solid #abb2b5;border-left:5px solid #20262a;background:rgba(255,255,255,.9)}}
-    .fact span{{display:block;color:#6b7479;font-size:12px;font-weight:900}}.fact b{{display:block;margin-top:5px;font-size:19px;overflow-wrap:anywhere}}
-    .chip-grid{{display:flex;flex-wrap:wrap;gap:7px}}
-    .chip-grid i{{padding:7px 11px;border:1px solid #a7afb2;background:#eef0ef;font-style:normal;font-size:14px;font-weight:850}}
-    .resist-strip{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}}
-    .resist-cell{{padding:9px 11px;border:1px solid #c4c9cb;border-top:5px solid var(--el,#8a9296);background:#f2f4f4}}
-    .resist-cell span{{display:block;color:#4f5a60;font-size:13px;font-weight:900}}
-    .resist-cell b{{display:block;margin-top:4px;font-size:17px;font-weight:950}}
-    .ability{{padding:12px 14px;border:1px solid #abb2b5;border-left:5px solid #20262a;background:#fff}}
-    .ability + .ability{{margin-top:8px}}.ability b{{display:block;font-size:18px;font-weight:900;overflow-wrap:anywhere}}
-    .ability b.unnamed{{color:#8a9296}}.ability p{{margin:6px 0 0;color:#3f484d;font-size:15px;font-weight:750}}
-    .source{{display:flex;justify-content:space-between;gap:14px;padding:10px 13px;border:1px solid #abb2b5;background:#fff}}
-    .source + .source{{margin-top:7px}}.source b{{font-size:16px;font-weight:900;overflow-wrap:anywhere}}
-    .source span{{flex:none;color:#626c72;font-size:14px;font-weight:850}}.source.more{{border-style:dashed;color:#6f787d;justify-content:center}}
-    .catalog-grid{{display:grid;grid-template-columns:repeat(${CATALOG_COLUMNS},minmax(0,1fr));gap:8px}}
-    .catalog-item{{min-height:64px;padding:11px 13px;border:1px solid #9ba2a5;border-bottom:5px solid #f2c500;background:#fff}}
-    .catalog-item b{{display:block;font-size:16px;font-weight:900;overflow-wrap:anywhere}}
-    .catalog-item span{{display:block;margin-top:5px;color:#657076;font-size:12px;font-weight:850}}
-    footer{{display:flex;justify-content:space-between;gap:20px;margin-top:16px;padding-top:11px;border-top:3px solid #20262a;color:#697277;font-size:13px;font-weight:850;overflow-wrap:anywhere}}
-    </style></head><body><main class="ency-card {klass}">{hero}{body}
-    <footer><span>数据来源 AkeData</span><span>{_escape(revision)}</span></footer></main></body></html>"""
+_BASE_CSS = """
+*{box-sizing:border-box}
+html,body{margin:0;background:#e5e7e1;color:#15191d;
+  font-family:'Microsoft YaHei','PingFang SC','Noto Sans SC',Arial,sans-serif}
+body{padding:0;
+  background-image:linear-gradient(90deg,rgba(21,25,29,.045) 1px,transparent 1px),
+    linear-gradient(0deg,rgba(21,25,29,.045) 1px,transparent 1px);
+  background-size:40px 40px}
+.ency-card{width:max-content;min-width:__minw__;max-width:__maxw__;min-height:520px;padding:__pad__}
+.sheet{position:relative;overflow:hidden;background:#f7f8f4;
+  border:1px solid rgba(23,27,31,.28);box-shadow:0 2px 6px rgba(18,22,26,.07)}
+.hero{position:relative;display:flex;align-items:flex-start;justify-content:space-between;gap:26px;
+  padding:26px 30px 24px 34px;color:#fff;background:#171b1f}
+.hero::before{content:'';position:absolute;left:0;top:0;bottom:0;width:10px;background:var(--accent)}
+.hero-main{position:relative;flex:1;min-width:0}
+.hero-kicker{display:flex;align-items:center;gap:10px;font-size:11px;font-weight:900;
+  letter-spacing:.26em;color:rgba(255,255,255,.6)}
+.kicker-mark{width:16px;height:4px;background:var(--accent);display:block;flex:none}
+.kicker-tag{margin-left:2px;padding:3px 8px;background:var(--accent);color:#15191d;font-size:10.5px;
+  font-weight:900;letter-spacing:.16em}
+.hero h1{margin:13px 0 0;font-size:46px;line-height:1.04;font-weight:950;letter-spacing:-.01em;
+  color:#fff;overflow-wrap:anywhere}
+.hero-id{margin-top:11px;font:700 13px/1.2 Consolas,'SFMono-Regular',monospace;
+  color:rgba(255,255,255,.52);letter-spacing:.05em;overflow-wrap:anywhere}
+.hero-side{position:relative;display:flex;align-items:flex-start;gap:18px;flex:none}
+.hero-figure{display:flex;flex-direction:column;align-items:center;gap:10px}
+.hero-icon{width:112px;height:112px;object-fit:contain;padding:9px;background:rgba(255,255,255,.07);
+  border:1px solid rgba(255,255,255,.2);box-shadow:inset 0 0 0 4px rgba(255,255,255,.06)}
+.hero-icon.placeholder{display:flex;align-items:center;justify-content:center;
+  font:950 40px/1 'Arial Black',Arial;color:var(--accent);opacity:.9}
+.count-block,.page-block{display:flex;flex-direction:column;align-items:flex-end;gap:4px;
+  padding:10px 16px;border:1px solid rgba(255,255,255,.22);background:rgba(255,255,255,.07)}
+.count-block b{font:950 40px/1 'Arial Black',Arial;letter-spacing:-.02em;color:#fff}
+.count-block span,.page-block span{font-size:10.5px;font-weight:900;letter-spacing:.16em;
+  color:rgba(255,255,255,.6)}
+.page-block{background:var(--accent);border-color:var(--accent);color:#15191d}
+.page-block b{font:950 26px/1 'Arial Black',Arial}
+.page-block span{color:rgba(21,25,29,.6)}
+.spec{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(180px,1fr);
+  gap:8px;padding:16px 30px;background:rgba(255,255,255,.5);
+  border-bottom:1px solid rgba(23,27,31,.14)}
+.fact{padding:11px 15px;background:linear-gradient(180deg,rgba(255,255,255,.9),rgba(232,235,236,.9));
+  border:1px solid rgba(23,27,31,.22);border-left:6px solid var(--accent)}
+.fact span{display:block;font-size:12px;font-weight:900;letter-spacing:.12em;color:#4a555c}
+.fact b{display:block;margin-top:6px;font-size:24px;font-weight:950;overflow-wrap:anywhere}
+.ency-section{padding:19px 30px 0}
+.section-head{display:flex;align-items:center;gap:11px;padding-bottom:10px;border-bottom:4px solid #20252a}
+.section-head::before{content:'';flex:none;width:9px;height:22px;background:var(--accent)}
+.section-head h2{margin:0;font-size:24px;line-height:1;font-weight:950;letter-spacing:.01em}
+.section-meta{margin-left:auto;font-size:12px;font-weight:850;letter-spacing:.1em;color:#727b81}
+.section-body{padding-top:14px}
+p{margin:0;max-width:620px;font-size:15.5px;line-height:1.7;font-weight:700;color:#232a30;overflow-wrap:anywhere}
+p+p{margin-top:8px}
+p.deco{margin-top:12px;padding:11px 14px;border-left:3px solid #d3d7d1;background:#f5f6f1;
+  font-size:15px;color:#4a545b}
+.muted{color:#828a85;font-size:15px;font-weight:800}
+.chip-grid{display:flex;flex-wrap:wrap;gap:8px}
+.chip-grid i{display:inline-flex;align-items:center;padding:7px 12px;background:#e1e4e5;
+  border-left:5px solid #20252a;font-style:normal;font-size:13.5px;font-weight:900}
+.trail{display:flex;flex-wrap:wrap;align-items:center;gap:10px}
+.trail i{font-style:normal;font-size:14px;font-weight:900;padding:7px 12px;background:#e1e4e5;
+  border-left:5px solid #20252a}
+.trail i+i::before{content:'›';margin-right:10px;color:#a7aeaa;font-weight:900}
+.effect{display:flex;gap:12px;padding:13px 16px;background:rgba(255,255,255,.78);
+  border:1px solid rgba(23,27,31,.18);border-left:6px solid var(--accent)}
+.effect+.effect{margin-top:8px}
+.effect .mark{flex:none;width:8px;height:8px;margin-top:8px;background:var(--accent);transform:rotate(45deg)}
+.effect p{font-size:15.5px;line-height:1.6}
+.effect strong{font-weight:950}
+.spec-table{border:1px solid rgba(23,27,31,.22);background:rgba(255,255,255,.78)}
+.spec-row{display:flex;justify-content:space-between;align-items:baseline;gap:16px;padding:11px 16px;
+  border-bottom:1px solid rgba(23,27,31,.1)}
+.spec-row:last-child{border-bottom:none}
+.spec-row span{font-size:13px;font-weight:900;letter-spacing:.08em;color:#4a555c}
+.spec-row b{font:950 17px/1.2 Consolas,'SFMono-Regular',monospace;color:#171b1f}
+.stat-table{border:1px solid rgba(23,27,31,.22);background:rgba(255,255,255,.78)}
+.stat-head,.stat-row{display:grid;grid-template-columns:96px 1fr 1fr 1fr;align-items:baseline;
+  column-gap:16px;padding:10px 16px}
+.stat-head{background:#e4e8ea;border-bottom:1px solid rgba(23,27,31,.22);font-size:12px;font-weight:900;
+  letter-spacing:.12em;color:#4a555c}
+.stat-head span:not(:first-child){text-align:right}
+.stat-row{border-bottom:1px solid rgba(23,27,31,.1)}
+.stat-row:last-child{border-bottom:none}
+.stat-row b{font:950 15px/1.3 Consolas,'SFMono-Regular',monospace;letter-spacing:.02em;color:#4a555c}
+.stat-row span{font:950 19px/1.3 Consolas,'SFMono-Regular',monospace;text-align:right;color:#171b1f}
+.resist-strip{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:9px}
+.resist-cell{border:1px solid rgba(23,27,31,.22);border-left:6px solid var(--el,#8a9296);
+  background:linear-gradient(180deg,rgba(255,255,255,.9),rgba(232,235,236,.9))}
+.resist-cell .bar{display:none}
+.resist-cell .cell-body{padding:11px 15px 13px}
+.resist-cell span{display:block;font-size:12px;font-weight:900;letter-spacing:.12em;color:#4a555c}
+.resist-cell b{display:block;margin-top:6px;font:950 28px/1 'Arial Black',Arial;letter-spacing:-.01em}
+.ability{position:relative;padding:13px 17px 13px 60px;background:rgba(255,255,255,.78);
+  border:1px solid rgba(23,27,31,.18);border-left:6px solid #20252a}
+.ability+.ability{margin-top:8px}
+.ability b.idx{position:absolute;left:0;top:0;bottom:0;width:44px;display:flex;align-items:center;
+  justify-content:center;border-right:1px solid rgba(23,27,31,.12);background:#e9ecec;
+  font:900 14px/1 Consolas,'SFMono-Regular',monospace;color:#8b938e}
+.ability b.name{display:block;font-size:17px;font-weight:950;overflow-wrap:anywhere}
+.ability b.name.unnamed{color:#9aa19c;font-weight:850}
+.ability p{margin-top:6px;font-size:14.5px;line-height:1.6;color:#3e484f}
+.entry{display:grid;grid-template-columns:32px 1fr auto;align-items:center;gap:12px;padding:11px 14px;
+  background:rgba(255,255,255,.78);border:1px solid rgba(23,27,31,.16);border-left:5px solid #20252a}
+.entry+.entry{margin-top:7px}
+.entry b.idx{font:900 12px/1 Consolas,'SFMono-Regular',monospace;color:#9aa19c}
+.entry b{font-size:15.5px;font-weight:900;overflow-wrap:anywhere}
+.entry span{font-size:13px;font-weight:850;color:#6f7773}
+.entry-more{margin-top:8px;padding:11px 14px;background:rgba(23,27,31,.055);text-align:center;
+  font-size:13px;font-weight:850;color:#6f7773}
+.catalog-group{display:block}
+.group-head{display:flex;align-items:center;gap:11px;padding-bottom:10px;border-bottom:4px solid #20252a}
+.group-head::before{content:'';flex:none;width:9px;height:20px;background:var(--accent)}
+.group-head h3{margin:0;font-size:21px;font-weight:950;overflow-wrap:anywhere}
+.group-meta{margin-left:auto;font-size:12px;font-weight:850;letter-spacing:.1em;color:#727b81}
+.group-count{display:flex;align-items:baseline;gap:5px}
+.group-count b{font:950 22px/1 'Arial Black',Arial}
+.group-count span{font-size:11.5px;font-weight:900;letter-spacing:.12em;color:#727b81}
+.group-bar{height:4px;margin:12px 0 12px;background:#e4e8ea}
+.group-bar i{display:block;height:100%;background:var(--accent)}
+.hint{padding:13px 16px;background:rgba(23,27,31,.055);font-size:14px;font-weight:850;color:#5d6870}
+.catalog-grid{display:grid;grid-template-columns:repeat(var(--cols,6),minmax(176px,1fr));gap:9px}
+.catalog-item{position:relative;min-height:68px;padding:11px 13px 11px 15px;background:rgba(255,255,255,.78);
+  border:1px solid rgba(23,27,31,.18)}
+.catalog-item::before{content:'';position:absolute;left:0;top:0;bottom:0;width:4px;
+  background:var(--rarity,#c9cec8)}
+.catalog-item .num{position:absolute;right:9px;top:8px;font:900 10.5px/1 Consolas,'SFMono-Regular',monospace;
+  color:#b6bdb7;font-style:normal}
+.catalog-item b{display:block;padding-right:20px;font-size:15px;font-weight:950;line-height:1.28;
+  overflow-wrap:anywhere}
+.catalog-item span{display:block;margin-top:7px;font-size:12px;font-weight:850;color:#7c8480;
+  overflow-wrap:anywhere}
+footer{display:flex;justify-content:space-between;gap:20px;margin:24px 30px 24px;padding:13px 20px;
+  background:#20252a;font-size:11px;font-weight:900;letter-spacing:.08em;color:#aeb6ba}
+footer .mono{font-family:Consolas,'SFMono-Regular',monospace;letter-spacing:.04em}
+"""
+
+
+def _css() -> str:
+    return (
+        _BASE_CSS.replace("__minw__", f"{CARD_MIN_WIDTH}px")
+        .replace("__maxw__", f"{CARD_WIDTH}px")
+        .replace("__pad__", f"{_PAGE_PADDING}px")
+    )
+
+
+def _document(klass: str, accent: str, hero: str, body: str, revision: str) -> str:
+    return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><style>{_css()}</style></head>
+<body><main class="ency-card {klass}" style="--accent:{_attr(accent)}"><div class="sheet">{hero}{body}
+<footer><span>ENDFIELD · CODEX · 数据来源 AkeData</span><span class="mono">{_escape(str(revision).split("|", 1)[0])}</span></footer>
+</div></main></body></html>"""
 
 
 def _hero(
-    kicker: str,
+    *,
+    kind_en: str,
+    kind_cn: str,
     title: str,
     subtitle: str,
     icon_url: str,
-    facts: str,
-    accent: str = "",
+    facts: str = "",
 ) -> str:
-    style = f' style="--accent:#{accent}"' if accent else ""
-    icon = f'<img class="hero-icon" src="{_attr(icon_url)}" alt="">' if icon_url else ""
+    icon = (
+        f'<img class="hero-icon" src="{_attr(icon_url)}" alt="">'
+        if icon_url
+        else f'<div class="hero-icon placeholder">{_escape(kind_cn[:1])}</div>'
+    )
     return f"""
-    <header class="hero"{style}>
-      <div class="hero-copy"><small>{_escape(kicker)}</small><h1>{_escape(title)}</h1>
-      <p>{_escape(subtitle)}</p></div>
-      <div class="hero-side">{icon}</div>
-    </header>{facts}"""
+    <header class="hero">
+      <div class="hero-main">
+        <div class="hero-kicker"><i class="kicker-mark"></i>ENDFIELD · CODEX<span class="kicker-tag">{_escape(kind_cn)}</span></div>
+        <h1>{_escape(title)}</h1>
+        <div class="hero-id">{_escape(subtitle)}</div>
+      </div>
+      <div class="hero-side">
+        <div class="hero-figure">{icon}</div>
+      </div>
+    </header>
+{facts}"""
 
 
-def _fact_strip(facts: Sequence[tuple[str, str]]) -> str:
+def _spec(facts: Sequence[tuple[str, str]]) -> str:
     cells = "".join(
         f"<div class='fact'><span>{_escape(label)}</span><b>{_escape(value)}</b></div>"
         for label, value in facts
         if value
     )
-    return f"<div class='fact-strip'>{cells}</div>" if cells else ""
+    return f"<div class='spec'>{cells}</div>" if cells else ""
 
 
-def _section(title: str, body: str) -> str:
-    return f"<section class='ency-section'><div class='section-head'><h2>{_escape(title)}</h2></div>{body}</section>"
+def _spec_table(rows: Sequence[tuple[str, str]]) -> str:
+    if not rows:
+        return "<p class='muted'>暂无参数</p>"
+    cells = "".join(
+        f"<div class='spec-row'><span>{_escape(label)}</span><b>{_escape(value)}</b></div>"
+        for label, value in rows
+    )
+    return f"<div class='spec-table'>{cells}</div>"
+
+
+def _section(title: str, body: str, meta: str = "") -> str:
+    meta_html = f'<span class="section-meta">{_escape(meta)}</span>' if meta else ""
+    return (
+        '<section class="ency-section">'
+        f'<div class="section-head"><h2>{_escape(title)}</h2>{meta_html}</div>'
+        f'<div class="section-body">{body}</div></section>'
+    )
+
+
+def _sections(items: Sequence[tuple]) -> str:
+    return "".join(
+        _section(item[0], item[1], item[2] if len(item) > 2 else "") for item in items
+    )
+
+
+def _catalog_groups(view: EncyclopediaCatalogView) -> str:
+    """一组一段；多组才画占比条，整页没有图标时不逐组重复同一句提示。"""
+    total = max(1, view.total)
+    show_share = len(view.groups) > 1
+    # 列数跟着最大组走，条目少的目录不会被 6 列撑到满宽。
+    columns = min(CATALOG_COLUMNS, max((len(g.items) for g in view.groups), default=0) or 1)
+    counter = 0
+    blocks: list[str] = []
+    for group in view.groups:
+        share = round(group.count * 100 / total)
+        body = ""
+        if group.items:
+            tiles = []
+            for item in group.items:
+                counter += 1
+                tiles.append(_catalog_item(item, counter))
+            body = (
+                f'<div class="catalog-grid" style="--cols:{columns}">'
+                f"{''.join(tiles)}</div>"
+            )
+        meta = f'<span class="group-meta">{share}%</span>' if show_share else ""
+        bar = f'<div class="group-bar"><i style="width:{share}%"></i></div>' if show_share else ""
+        blocks.append(
+            '<section class="ency-section catalog-group">'
+            f'<div class="group-head"><h3>{_escape(group.name)}</h3>{meta}'
+            f'<div class="group-count"><b>{group.count}</b><span>条</span></div></div>'
+            f"{bar}{f'<div class=\"section-body\">{body}</div>' if body else ''}</section>"
+        )
+    if not any(group.items for group in view.groups):
+        blocks.append(
+            "<section class='ency-section'><div class='hint'>"
+            "发送分组名可查看该类型的图标页。</div></section>"
+        )
+    return "".join(blocks) or "<section class='ency-section'><p class='muted'>暂无条目</p></section>"
 
 
 def _paragraph(text: str) -> str:
     return f"<p>{_multiline(text)}</p>" if str(text or "").strip() else "<p class='muted'>暂无</p>"
+
+
+def _rich_paragraph(text: str) -> str:
+    """正文同样过一遍富文本：把 <@ba.x>…</> 收成强调文本，不让标记直接露在卡上。"""
+    return f"<p>{_rich(text, {})}</p>" if str(text or "").strip() else "<p class='muted'>暂无</p>"
 
 
 def _chips(values: Sequence[str], empty: str = "") -> str:
@@ -430,16 +737,18 @@ def _chips(values: Sequence[str], empty: str = "") -> str:
     return "<div class='chip-grid'>" + "".join(f"<i>{_escape(value)}</i>" for value in cleaned) + "</div>"
 
 
-def _catalog_item(item) -> str:
+def _catalog_item(item, number: int) -> str:
+    color = _RARITY_COLORS.get(item.rarity, _RARITY_FALLBACK) if item.rarity else _RARITY_FALLBACK
+    subtitle = f"<span>{_escape(item.subtitle)}</span>" if item.subtitle else ""
     return (
-        f"<div class='catalog-item'><b>{_escape(item.name)}</b>"
-        f"<span>{_escape(item.subtitle)}</span></div>"
+        f'<div class="catalog-item" style="--rarity:{color}">'
+        f'<i class="num">{number:02d}</i><b>{_escape(item.name)}</b>{subtitle}</div>'
     )
 
 
 def _rich(line: str, styles: Mapping) -> str:
     """效果句里的 <@>、<#> 着色；颜色来自本卡视图的 term style。"""
-    escaped = _escape(line)
+    escaped = _escape(line).replace("\n", "<br>")
 
     def style_tag(match: re.Match[str]) -> str:
         term_id, body = match.group(1), match.group(2)
@@ -453,6 +762,10 @@ def _rich(line: str, styles: Mapping) -> str:
     return _STYLE_RE.sub(style_tag, _LINK_RE.sub(style_tag, escaped))
 
 
+def _count_meta(values: Sequence, unit: str = "项") -> str:
+    return f"{len(values)} {unit}" if values else ""
+
+
 def _seconds(value: float | None) -> str:
     return f"{value:g} 秒" if value else ""
 
@@ -463,6 +776,14 @@ def _count(value: int | None) -> str:
 
 def _percent(value: float | None) -> str:
     return f"{value:g}%" if value is not None else "—"
+
+
+def _stat_number(value: int | None) -> str:
+    return f"{value:,}" if value is not None else "—"
+
+
+def _number_text(value: float | None) -> str:
+    return f"{value:g}" if value else ""
 
 
 def _multiline(value: str) -> str:

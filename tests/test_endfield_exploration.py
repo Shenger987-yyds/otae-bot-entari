@@ -659,6 +659,7 @@ class ExplorationAsyncTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         await handlers._ACCOUNT_PAGE_CACHE.clear()
+        await handlers._CARD_DETAIL_CACHE.clear()
 
     async def run_command(
         self,
@@ -670,7 +671,11 @@ class ExplorationAsyncTests(unittest.IsolatedAsyncioTestCase):
         error=None,
         repeat=1,
         game_version="1.5",
+        between=None,
     ):
+        # Every call stands for a fresh query; the 60 s card/detail reuse is
+        # exercised explicitly through ``repeat``.
+        await handlers._CARD_DETAIL_CACHE.clear()
         roles = self.roles if roles is None else roles
         store = Mock()
         store.list_roles.side_effect = lambda user: roles if user == "caller" else []
@@ -702,7 +707,9 @@ class ExplorationAsyncTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(handlers, "_finish_pngs", send),
         ):
-            for _ in range(repeat):
+            for index in range(repeat):
+                if index and between is not None:
+                    between()
                 await handlers._handle_command(
                     matcher, SimpleNamespace(), parse_command(text)
                 )
@@ -744,10 +751,22 @@ class ExplorationAsyncTests(unittest.IsolatedAsyncioTestCase):
         render.assert_not_awaited()
         send.assert_not_awaited()
 
-    async def test_same_snapshot_reuses_images_but_still_fetches_current_data(self):
-        _, _, fetch, render, send = await self.run_command(repeat=2)
-        self.assertEqual(fetch.await_count, 2)
-        self.assertEqual(render.await_count, 1)
+    async def test_same_snapshot_reuses_images_and_data_for_a_minute_only(self):
+        now = [1000.0]
+
+        def a_minute_later():
+            now[0] += 61
+
+        with patch.object(handlers._CARD_DETAIL_CACHE, "_clock", lambda: now[0]):
+            _, _, fetch, render, send = await self.run_command(repeat=2)
+            self.assertEqual(fetch.await_count, 1)  # within 60 s: reused
+            self.assertEqual(render.await_count, 1)
+            self.assertEqual(send.await_count, 2)
+            _, _, fetch, render, send = await self.run_command(
+                repeat=2, between=a_minute_later
+            )
+        self.assertEqual(fetch.await_count, 2)  # after 60 s: current data again
+        render.assert_not_awaited()  # unchanged data keeps the first round's images
         self.assertEqual(send.await_count, 2)
 
     async def test_changed_counts_and_chat_visibility_do_not_reuse_old_images(self):

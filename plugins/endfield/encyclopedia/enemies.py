@@ -14,12 +14,16 @@ from .models import (
     EncyclopediaIndex,
     EnemyAbilityView,
     EnemyResistanceView,
+    EnemyStatView,
     EnemyView,
     IndexEntry,
 )
 
 # 附录 B.4：同目录没有带 displayType 字段的枚举表，故留空，兜底统一用「类型{n}」。
 DISPLAY_TYPE_NAMES: dict[int, str] = {}
+
+# 等级节点最多画几个；真实属性模板可能给几十个等级，卡上只取等距节点。
+STAT_NODE_LIMIT = 6
 
 # 与关卡卡 `_enemy_resistances` 一致；颜色存不带 `#` 的形式，draw 再加。
 RESISTANCE_FIELDS: tuple[tuple[str, str, str, str], ...] = (
@@ -79,6 +83,7 @@ async def build_enemy_view(snapshot: AkeSnapshot, template_id: str) -> EnemyView
     abilities = await _abilities(snapshot, row.get("abilityDescIds"), texts)
     template_ids, attributes = await _attribute_templates(snapshot, str(template_id))
     resistances = _resistances(attributes)
+    stats, stat_node_count = _stats(attributes)
     distributions = await akedata.translate_field(
         snapshot, akedata.DISTRIBUTION_TABLE, row.get("distributionIds"), "areaName"
     )
@@ -96,6 +101,10 @@ async def build_enemy_view(snapshot: AkeSnapshot, template_id: str) -> EnemyView
         distributions=tuple(distributions),
         distribution_count=len(row.get("distributionIds") or ()),
         variant_count=await _variant_count(snapshot, str(template_id)),
+        stats=stats,
+        stat_node_count=stat_node_count,
+        poise=_int(attributes.get("initialSuperArmor")),
+        tower_attack=_float(attributes.get("attackValueAgainstTower")),
         revision=snapshot.revision,
     )
 
@@ -151,6 +160,42 @@ async def _variant_count(snapshot: AkeSnapshot, template_id: str) -> int:
         for row in enemies.values()
         if isinstance(row, dict) and str(row.get("templateId") or "") == template_id
     )
+
+
+def _stats(attributes: dict) -> tuple[tuple[EnemyStatView, ...], int]:
+    """等级节点取等距样本；节点多于 STAT_NODE_LIMIT 时只留首末之间的均匀点。"""
+    if not attributes:
+        return (), 0
+    rows: list[EnemyStatView] = []
+    for row in attributes.get("levelDependentAttributes") or ():
+        if not isinstance(row, dict):
+            continue
+        values = {
+            _int(item.get("attrType")): item.get("attrValue")
+            for item in row.get("attrs") or ()
+            if isinstance(item, dict)
+        }
+        level = _int(values.get(0))
+        if level is None:
+            continue
+        rows.append(
+            EnemyStatView(
+                level=level,
+                hp=_int(values.get(1)),
+                attack=_int(values.get(2)),
+                defense=_int(values.get(3)),
+            )
+        )
+    if not rows:
+        return (), 0
+    rows.sort(key=lambda stat: stat.level)
+    total = len(rows)
+    if total <= STAT_NODE_LIMIT:
+        return tuple(rows), total
+    picks = sorted(
+        {round(index * (total - 1) / (STAT_NODE_LIMIT - 1)) for index in range(STAT_NODE_LIMIT)}
+    )
+    return tuple(rows[index] for index in picks), total
 
 
 def _resistances(attributes: dict) -> tuple[EnemyResistanceView, ...]:
