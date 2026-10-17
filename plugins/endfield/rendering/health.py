@@ -11,6 +11,8 @@ from typing import Iterable, Iterator
 @dataclass(slots=True)
 class RenderHealth:
     missing: set[str] = field(default_factory=set)
+    # Time spent preparing assets in this render; parallel batches add up.
+    asset_seconds: float = 0.0
 
     @property
     def complete(self) -> bool:
@@ -38,6 +40,12 @@ def record_assets(requested: Iterable[str], resolved: Iterable[str]) -> None:
         ready = set(resolved)
         health.missing.update(url for url in requested if url and url not in ready)
         health.missing.difference_update(ready)
+
+
+def record_asset_seconds(seconds: float) -> None:
+    health = _health.get()
+    if health is not None:
+        health.asset_seconds += max(0.0, seconds)
 
 
 def record_fallback_success(candidates: Iterable[str]) -> None:

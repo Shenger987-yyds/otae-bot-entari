@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .health import record_assets, record_fallback_success
+from .health import record_asset_seconds, record_assets, record_fallback_success
 
 import asyncio
 import base64
@@ -14,7 +14,7 @@ import tempfile
 import unicodedata
 import zlib
 from collections import OrderedDict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
@@ -163,6 +163,8 @@ class _PreparedAssets:
     resources: dict[str, BrowserResource]
     contents: dict[str, bytes]
     failures: dict[str, str]
+    # SHA-256 of each fetched body, from the cache when it already knew it.
+    digests: dict[str, str] = field(default_factory=dict)
 
 
 async def draw_operator_card(view: OperatorView) -> bytes:
@@ -2203,7 +2205,11 @@ async def _prepare_operator_card_html(view: OperatorView, *, inline: bool) -> Pr
         for term, style in term_styles.items()
         if style.icon_url and term in used_terms
     }
-    layout = await _portrait_layout(view, assets.contents.get(portrait_source, b""))
+    layout = await _portrait_layout(
+        view,
+        assets.contents.get(portrait_source, b""),
+        digest=assets.digests.get(portrait_source, ""),
+    )
     return PreparedCardHtml(
         _render_html(view, mapped.get("portrait", ""), skill_icons, talent_icons, term_styles, term_icons, layout),
         assets.resources,
@@ -3589,6 +3595,7 @@ def _portrait_render_budget() -> float:
 
 
 async def _prepare_assets(urls: Iterable[str], *, inline: bool) -> _PreparedAssets:
+    started = perf_counter()
     unique = tuple(dict.fromkeys(str(url) for url in urls if url))
     direct = {url: url for url in unique if url.startswith("data:")}
     remote_urls = [url for url in unique if not url.startswith("data:")]
@@ -3614,6 +3621,7 @@ async def _prepare_assets(urls: Iterable[str], *, inline: bool) -> _PreparedAsse
     output = dict(direct)
     browser_resources: dict[str, BrowserResource] = {}
     contents: dict[str, bytes] = {}
+    digests: dict[str, str] = {}
     for url, resource in resources.items():
         if resource is None:
             output[url] = ""
@@ -3622,15 +3630,19 @@ async def _prepare_assets(urls: Iterable[str], *, inline: bool) -> _PreparedAsse
         if not mime or mime == "application/octet-stream":
             mime = mimetypes.guess_type(url)[0] or "image/webp"
         contents[url] = resource.content
+        # Disk hits and fresh downloads already carry the digest; hash only when it is needed.
+        if known := getattr(resource, "digest", ""):
+            digests[url] = known
         if inline:
             output[url] = f"data:{mime};base64,{base64.b64encode(resource.content).decode('ascii')}"
             continue
-        digest = hashlib.sha256(resource.content).hexdigest()
+        digest = digests.setdefault(url, known or hashlib.sha256(resource.content).hexdigest())
         browser_url = f"https://endfield.local/assets/{digest}"
         output[url] = browser_url
         browser_resources.setdefault(browser_url, BrowserResource(resource.content, mime))
     record_assets(unique, (url for url, mapped in output.items() if mapped))
-    return _PreparedAssets(output, browser_resources, contents, failures)
+    record_asset_seconds(perf_counter() - started)
+    return _PreparedAssets(output, browser_resources, contents, failures, digests)
 
 
 def _asset_ready(assets: _PreparedAssets, url: str) -> bool:
@@ -3655,6 +3667,7 @@ def _merge_prepared_assets(left: _PreparedAssets, right: _PreparedAssets) -> _Pr
         {**left.resources, **right.resources},
         {**left.contents, **right.contents},
         {**left.failures, **right.failures},
+        {**left.digests, **right.digests},
     )
 
 
@@ -3729,13 +3742,13 @@ async def _resolve_asset_groups_within_budget(
     return assets, mapped, chosen_source
 
 
-async def _portrait_layout(view: OperatorView, content: bytes) -> PortraitLayout:
+async def _portrait_layout(view: OperatorView, content: bytes, *, digest: str = "") -> PortraitLayout:
     override = _PORTRAIT_LAYOUT_OVERRIDES.get(view.name)
     if override:
         return PortraitLayout(*override)
     if not content:
         return PortraitLayout()
-    digest = hashlib.sha256(content).hexdigest()
+    digest = digest or hashlib.sha256(content).hexdigest()
     cached = _PORTRAIT_LAYOUT_CACHE.get(digest)
     if cached is not None:
         _PORTRAIT_LAYOUT_CACHE.move_to_end(digest)

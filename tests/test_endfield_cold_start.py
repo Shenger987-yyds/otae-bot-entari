@@ -241,6 +241,26 @@ class ColdStartNoticeTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(matcher.sent, [])
 
+    async def test_loaded_index_checks_a_whole_card_without_thread_hops(self):
+        self.transport(lambda request: httpx.Response(200, content=b"png", headers={"content-type": "image/png"}))
+        urls = [IMAGE_URL.replace("test-icon", f"icon-{index}") for index in range(40)]
+        for url in urls:
+            await http.fetch_bytes(url, namespace=cold_start.REMOTE_ASSET_NAMESPACE)
+        self.assertTrue(self.images.flush(5))
+        await http.clear_http_cache(include_disk=False)
+        self.images.metadata("warm-up")  # the first lookup loads the index
+        self.assertTrue(self.images.index_loaded)
+        with patch.object(http.asyncio, "to_thread", side_effect=AssertionError("thread hop")):
+            self.assertFalse(
+                await cold_start.remote_assets_cold(urls, namespace=cold_start.REMOTE_ASSET_NAMESPACE)
+            )
+            self.assertTrue(
+                await cold_start.remote_assets_cold(
+                    [*urls, IMAGE_URL.replace("test-icon", "never")],
+                    namespace=cold_start.REMOTE_ASSET_NAMESPACE,
+                )
+            )
+
     async def test_disk_hit_and_conditional_revalidation_count_as_cached(self):
         self.transport(
             lambda request: httpx.Response(

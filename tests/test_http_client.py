@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+import sqlite3
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import httpx
@@ -9,6 +14,8 @@ import httpx
 from otae_bot.infrastructure.cache import AsyncTTLCache
 from otae_bot.infrastructure.http import client as http_client
 from otae_bot.infrastructure.http import tls
+from otae_bot.infrastructure.http.asset_policy import AssetFetchSettings, configure_asset_settings
+from otae_bot.infrastructure.http.disk import PublicImageDiskCache
 
 
 class SharedSslContextTests(unittest.IsolatedAsyncioTestCase):
@@ -329,6 +336,252 @@ class AssetFetchResilienceTests(unittest.IsolatedAsyncioTestCase):
             http_client.classify_failure(http_client.HostCircuitOpen("cooling down")),
             (True, "circuit_open"),
         )
+
+
+AKE_IMAGE = "https://data.akedata.wiki/public/images/assets/test/{}.png"
+I18N_URL = "https://data.akedata.wiki/public/1.5.3/1-1/TableCfg/I18nTextTable_CN.json"
+
+
+class CacheKeyCompatibilityTests(unittest.IsolatedAsyncioTestCase):
+    """磁盘 key 由请求头指纹组成：不再构造请求后必须与 build_request 逐字节一致，否则线上整库失配。"""
+
+    async def asyncSetUp(self):
+        await http_client.close_http_client()
+
+    async def asyncTearDown(self):
+        await http_client.close_http_client()
+
+    async def legacy_coordinates(self, url, *, namespace, kind, params=None, headers=None):
+        client = await http_client._get_owned_client()
+        built = client.build_request("GET", url, params=params, headers=headers).headers
+        key = (
+            namespace,
+            url,
+            http_client._normalized_params(params),
+            http_client._header_fingerprint(built),
+            kind,
+        )
+        return key, hashlib.sha256(repr(key).encode()).hexdigest()
+
+    async def test_disk_keys_match_the_request_builder(self):
+        cases = [
+            (AKE_IMAGE.format("plain"), "endfield-assets", "bytes", None, None),
+            (
+                "https://data.akedata.wiki/public/1.5.3/1-1/TableCfg/CharacterTable.json",
+                "akedata",
+                "json",
+                None,
+                {
+                    "User-Agent": "otae-bot-entari/1.0",
+                    "Accept": "application/json, text/plain, */*",
+                    "Accept-Language": "zh-CN,zh;q=0.9",
+                    "Referer": "https://cf.akedata.top/",
+                },
+            ),
+            ("https://bbs.hycdn.cn:443/image/a.png", "endfield-gacha-images", "bytes", None, {"accept": "image/*"}),
+            ("https://example.test:8443/api", "example", "json", {"q": "x"}, {"Host": "override.test"}),
+        ]
+        for url, namespace, kind, params, headers in cases:
+            with self.subTest(url=url):
+                key, _eligible, disk_key, _ttl = await http_client._cache_coordinates(
+                    url,
+                    namespace=namespace,
+                    response_kind=kind,
+                    params=params,
+                    headers=headers,
+                    ttl_seconds=600,
+                )
+                expected_key, expected_disk_key = await self.legacy_coordinates(
+                    url, namespace=namespace, kind=kind, params=params, headers=headers
+                )
+                self.assertEqual(key, expected_key)
+                self.assertEqual(disk_key, expected_disk_key)
+
+    async def test_client_cookies_still_use_the_builder_and_stay_off_disk(self):
+        client = await http_client._get_owned_client()
+        client.cookies.set("session", "secret")
+        url = "https://assets.fz.wiki/a.png"
+        key, eligible, _disk_key, _ttl = await http_client._cache_coordinates(
+            url, namespace="endfield-assets", response_kind="bytes", params=None, headers=None, ttl_seconds=600
+        )
+        self.assertFalse(eligible)
+        self.assertEqual(key, (await self.legacy_coordinates(url, namespace="endfield-assets", kind="bytes"))[0])
+
+    def test_pool_routing(self):
+        self.assertIs(http_client._pool_for(I18N_URL, "json"), http_client._i18n_cache)
+        self.assertIs(
+            http_client._pool_for(I18N_URL.replace("_CN", "_EN"), "json"), http_client._table_cache
+        )
+        self.assertIs(
+            http_client._pool_for("https://data.akedata.wiki/manifest.json?t=1", "json"),
+            http_client._response_cache,
+        )
+        self.assertIs(http_client._pool_for(AKE_IMAGE.format("a"), "bytes"), http_client._asset_cache)
+        self.assertEqual(http_client._i18n_cache.max_entries, 1)
+
+
+class _DiskBackedCase(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        await http_client.close_http_client()
+        self.directory = tempfile.TemporaryDirectory()
+        root = Path(self.directory.name)
+        self.images = PublicImageDiskCache(root / "images.sqlite3", 64 << 20)
+        self.tables = PublicImageDiskCache(root / "tables.sqlite3", 64 << 20)
+        self.patches = [
+            mock.patch.object(http_client, "public_images", self.images),
+            mock.patch.object(http_client, "public_tables", self.tables),
+        ]
+        for patcher in self.patches:
+            patcher.start()
+        self.requests: list[httpx.Request] = []
+
+    async def asyncTearDown(self):
+        await http_client.close_http_client()
+        for patcher in self.patches:
+            patcher.stop()
+        self.images.close()
+        self.tables.close()
+        self.directory.cleanup()
+
+    def install(self, respond):
+        def handler(request):
+            self.requests.append(request)
+            return respond(request)
+
+        configure_asset_settings(AssetFetchSettings())
+        for name in ("_asset_client", "_client"):
+            setattr(http_client, name, httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+
+    async def forget_memory(self):
+        self.assertTrue(self.images.flush(5))
+        self.assertTrue(self.tables.flush(5))
+        await http_client.clear_http_cache(include_disk=False)
+
+    @staticmethod
+    def png(body: bytes, **headers):
+        return httpx.Response(200, content=body, headers={"content-type": "image/png", **headers})
+
+
+class LargeImageBypassTests(_DiskBackedCase):
+    async def test_large_disk_backed_images_skip_memory_and_come_back_from_disk(self):
+        body = b"P" * (2 << 20)
+        self.install(lambda request: self.png(body, etag='"v1"', **{"cache-control": "max-age=600"}))
+        url = AKE_IMAGE.format("portrait")
+        first = await http_client.fetch_bytes(url, namespace="endfield-assets", asset=True)
+        self.assertEqual(first.digest, hashlib.sha256(body).hexdigest())
+        self.assertTrue(first.disk_backed)
+        self.assertEqual((await http_client._asset_cache.stats()).entries, 0)
+        metrics = (await http_client.get_http_cache_diagnostics())["namespaces"]["endfield-assets"]
+        self.assertEqual(metrics["bypassed"], 1)
+        await self.forget_memory()
+        again = await http_client.fetch_bytes(url, namespace="endfield-assets", asset=True)
+        self.assertEqual(again.content, body)
+        self.assertEqual(again.digest, first.digest)
+        self.assertEqual(len(self.requests), 1)
+        metrics = (await http_client.get_http_cache_diagnostics())["namespaces"]["endfield-assets"]
+        self.assertEqual((metrics["large_disk_hits"], metrics["bypassed"]), (1, 1))
+
+    async def test_large_images_without_a_disk_copy_stay_in_memory(self):
+        self.install(lambda request: self.png(b"C" * (2 << 20)))
+        url = "https://example.test/calendar.png"  # not a whitelisted public image host
+        await http_client.fetch_bytes(url, namespace="endfield-official-calendar", max_bytes=4 << 20)
+        await http_client.fetch_bytes(url, namespace="endfield-official-calendar", max_bytes=4 << 20)
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual((await http_client._asset_cache.stats()).entries, 1)
+
+
+class BatchPartitionTests(_DiskBackedCase):
+    async def test_hot_batch_reads_disk_in_one_call_then_memory(self):
+        self.install(
+            lambda request: self.png(request.url.path.encode(), etag='"v1"', **{"cache-control": "max-age=600"})
+        )
+        urls = [AKE_IMAGE.format(f"icon-{index}") for index in range(12)]
+        await http_client.fetch_many_resilient(urls, namespace="endfield-assets")
+        self.assertEqual(len(self.requests), 12)
+        await self.forget_memory()
+        real_get_many = self.images.get_many
+        with (
+            mock.patch.object(self.images, "get", side_effect=AssertionError("per-key disk read")),
+            mock.patch.object(self.images, "get_many", side_effect=real_get_many) as get_many,
+            mock.patch.object(http_client, "logger") as log,
+        ):
+            results, failures = await http_client.fetch_many_resilient(urls, namespace="endfield-assets")
+            third, _ = await http_client.fetch_many_resilient(urls, namespace="endfield-assets")
+        self.assertEqual(failures, {})
+        self.assertEqual(len(self.requests), 12)  # nothing new from the network
+        get_many.assert_called_once()
+        for url in urls:
+            self.assertEqual(results[url].content, httpx.URL(url).path.encode())
+            self.assertEqual(results[url].digest, hashlib.sha256(results[url].content).hexdigest())
+            self.assertIs(third[url], results[url])  # published to the memory pool
+        batches = [call.args[0] for call in log.info.call_args_list if "fetch batch" in call.args[0]]
+        self.assertIn("mem=0 disk=12 net=0", batches[0])
+        self.assertIn("mem=12 disk=0 net=0", batches[1])
+        log.warning.assert_not_called()
+
+    async def test_expired_rows_and_misses_still_go_to_the_network(self):
+        self.install(lambda request: self.png(b"img", etag='"v1"', **{"cache-control": "max-age=0"}))
+        cached, missing = AKE_IMAGE.format("expired"), AKE_IMAGE.format("missing")
+        await http_client.fetch_bytes(cached, namespace="endfield-assets", asset=True)
+        await self.forget_memory()
+        with mock.patch.object(http_client, "logger") as log:
+            results, failures = await http_client.fetch_many_resilient(
+                [cached, missing, "https://assets.invalid/x.png"], namespace="endfield-assets", attempts=1
+            )
+        self.assertEqual(failures, {})
+        self.assertTrue(all(resource is not None for resource in results.values()))
+        revalidation = [
+            request for request in self.requests[1:] if request.url.path.endswith("/expired.png")
+        ]
+        self.assertEqual(revalidation[0].headers.get("if-none-match"), '"v1"')  # revalidated, not reused
+        batch = next(call.args[0] for call in log.info.call_args_list if "fetch batch" in call.args[0])
+        self.assertIn("mem=0 disk=0 net=3", batch)
+
+
+class RevalidateTests(_DiskBackedCase):
+    async def test_revalidate_sends_a_conditional_request_despite_fresh_copies(self):
+        def respond(request):
+            if request.headers.get("if-none-match") == '"v1"':
+                return httpx.Response(304, headers={"etag": '"v1"', "cache-control": "max-age=600"})
+            return httpx.Response(
+                200,
+                content=json.dumps({"k": "v"}).encode(),
+                headers={"etag": '"v1"', "cache-control": "max-age=600", "content-type": "application/json"},
+            )
+
+        self.install(respond)
+        first = await http_client.fetch_json(I18N_URL, namespace="akedata", ttl_seconds=86400)
+        self.assertEqual(await http_client.fetch_json(I18N_URL, namespace="akedata", ttl_seconds=86400), first)
+        self.assertEqual(len(self.requests), 1)  # memory serves the second read
+        self.assertTrue(self.tables.flush(5))
+        again = await http_client.fetch_json(I18N_URL, namespace="akedata", ttl_seconds=86400, revalidate=True)
+        self.assertEqual(again, {"k": "v"})
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(self.requests[1].headers.get("if-none-match"), '"v1"')
+        self.assertTrue(self.tables.flush(5))
+        with sqlite3.connect(self.tables.path) as connection:
+            (stored,) = connection.execute("SELECT content FROM public_images_v1").fetchone()
+        self.assertEqual(json.loads(stored), {"k": "v"})  # 304 kept the stored body
+        await http_client.fetch_json(I18N_URL, namespace="akedata", ttl_seconds=86400)
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual((await http_client._i18n_cache.stats()).entries, 1)
+
+    async def test_i18n_slot_outlives_the_server_max_age_but_not_private_copies(self):
+        now = [1000.0]
+        self.install(
+            lambda request: httpx.Response(
+                200, content=b"{}", headers={"cache-control": "max-age=60", "content-type": "application/json"}
+            )
+        )
+        with mock.patch.object(http_client.time, "time", side_effect=lambda: now[0]):
+            await http_client.fetch_json(I18N_URL, namespace="akedata", ttl_seconds=86400)
+            fresh = http_client._i18n_cache._entries
+            (entry,) = fresh.values()
+        self.assertGreater(entry.expires_at - http_client._i18n_cache._clock(), 3600)
+        self.assertEqual(http_client._resident_ttl(http_client.HttpResource(b"", "", 200, "", expires_at=now[0] - 1)), 0)
+        stale = http_client.HttpResource(b"", "", 200, "", expires_at=now[0] + 60, stale=True)
+        with mock.patch.object(http_client.time, "time", return_value=now[0]):
+            self.assertEqual(http_client._resident_ttl(stale), 60)
 
 
 if __name__ == "__main__":

@@ -58,10 +58,21 @@ def _cache_budget(name: str, default_mib: int) -> int:
 
 API_CACHE_MAX_BYTES = _cache_budget("OTAE_HTTP_API_CACHE_MIB", 8)
 TABLE_CACHE_MAX_BYTES = _cache_budget("OTAE_HTTP_TABLE_CACHE_MIB", 64)
-ASSET_CACHE_MAX_BYTES = _cache_budget("OTAE_HTTP_ASSET_CACHE_MIB", 24)
-HTTP_CACHE_MAX_BYTES = (
-    API_CACHE_MAX_BYTES + TABLE_CACHE_MAX_BYTES + ASSET_CACHE_MAX_BYTES
+# 当前版本的 I18nTextTable_CN（解析后计量约 45 MiB）单独一个常驻槽，不和其它表在 LRU 里互挤。
+I18N_CACHE_MAX_BYTES = _cache_budget("OTAE_HTTP_I18N_CACHE_MIB", 64)
+# 小图池：要装得下一张账号卡的两百多张图标。
+ASSET_CACHE_MAX_BYTES = _cache_budget("OTAE_HTTP_ASSET_CACHE_MIB", 64)
+# 超过这个体积的图（立绘、横幅）只要磁盘上有副本就不进内存池，命中时直接读磁盘。
+ASSET_LARGE_ENTRY_BYTES = (
+    max(1, int(os.environ.get("OTAE_HTTP_ASSET_LARGE_ENTRY_KIB", 1024))) * 1024
 )
+HTTP_CACHE_MAX_BYTES = (
+    API_CACHE_MAX_BYTES
+    + TABLE_CACHE_MAX_BYTES
+    + I18N_CACHE_MAX_BYTES
+    + ASSET_CACHE_MAX_BYTES
+)
+_I18N_RESIDENT_SUFFIX = "/I18nTextTable_CN.json"
 
 RequestKey = tuple[str, str, tuple[tuple[str, str], ...], str, str]
 _suppress_request_log: contextvars.ContextVar[bool] = contextvars.ContextVar(
@@ -99,6 +110,10 @@ class HttpResource:
     expires_at: float | None = None
     # 过期的磁盘副本：重新校验失败或整批截止时间已到时用来代替空白。
     stale: bool = False
+    # 正文的 SHA-256（十六进制）；磁盘命中与本进程下载的公共图片都会带上，未知时为空。
+    digest: str = field(default="", compare=False)
+    # 磁盘上已有（或已排队写入）同样的正文：大图因此可以不占内存池。
+    disk_backed: bool = field(default=False, compare=False)
 
 
 _client: httpx.AsyncClient | None = None
@@ -125,35 +140,61 @@ def _cache_event(key: RequestKey, event: str, value: float) -> None:
         counters[event] = counters.get(event, 0) + value
 
 
-def _new_pool(budget: int) -> AsyncTTLCache[RequestKey, HttpResource]:
+def _expires_ttl(resource: HttpResource) -> float:
+    if resource.expires_at is None:
+        return float("inf")
+    return max(0, resource.expires_at - time.time())
+
+
+def _resident_ttl(resource: HttpResource) -> float:
+    """The I18n slot keeps a fresh copy for the caller's TTL, past the server max-age.
+
+    Table paths are version-addressed, so the bytes behind one path do not
+    change; a new build is a new path (and a new key). Private, no-cache and
+    stale copies still expire as usual.
+    """
+    remaining = _expires_ttl(resource)
+    return remaining if resource.stale or remaining <= 0 else float("inf")
+
+
+def _new_pool(
+    budget: int,
+    *,
+    max_entries: int = 512,
+    max_entry_bytes: int | None = None,
+    ttl_for_value: Callable[[HttpResource], float] = _expires_ttl,
+) -> AsyncTTLCache[RequestKey, HttpResource]:
     return AsyncTTLCache(
         ttl_seconds=DEFAULT_CACHE_TTL_SECONDS,
         max_bytes=budget,
-        max_entries=512,
+        max_entries=max_entries,
         sizeof=lambda resource: len(resource.content) + resource.decoded_bytes,
         on_event=_cache_event,
-        ttl_for_value=lambda resource: (
-            float("inf")
-            if resource.expires_at is None
-            else max(0, resource.expires_at - time.time())
-        ),
+        ttl_for_value=ttl_for_value,
+        max_entry_bytes=max_entry_bytes,
+        # Only bodies a disk row also holds may skip memory; the rest stay cached.
+        may_bypass=lambda resource: resource.disk_backed,
     )
 
 
 _response_cache = _new_pool(API_CACHE_MAX_BYTES)
 _table_cache = _new_pool(TABLE_CACHE_MAX_BYTES)
-_asset_cache = _new_pool(ASSET_CACHE_MAX_BYTES)
-_cache_pools = (_response_cache, _table_cache, _asset_cache)
+# One entry: a new build's table (a new path) replaces the previous one.
+_i18n_cache = _new_pool(I18N_CACHE_MAX_BYTES, max_entries=1, ttl_for_value=_resident_ttl)
+_asset_cache = _new_pool(ASSET_CACHE_MAX_BYTES, max_entry_bytes=ASSET_LARGE_ENTRY_BYTES)
+_cache_pools = (_response_cache, _table_cache, _i18n_cache, _asset_cache)
+_POOL_NAMES = ("api", "tables", "i18n", "assets")
 
 
 def _pool_for(url: str, response_kind: str) -> AsyncTTLCache[RequestKey, HttpResource]:
     if response_kind == "bytes":
         return _asset_cache
     parts = urlsplit(url)
-    if parts.hostname == "data.akedata.wiki" and not parts.path.endswith(
-        "/manifest.json"
-    ):
-        return _table_cache
+    if parts.hostname == "data.akedata.wiki":
+        if parts.path.endswith(_I18N_RESIDENT_SUFFIX):
+            return _i18n_cache
+        if not parts.path.endswith("/manifest.json"):
+            return _table_cache
     return _response_cache
 
 
@@ -415,6 +456,13 @@ async def _asset_get(url: str, host: str, request: dict) -> httpx.Response:
     return await proxy_client.get(url, **request)
 
 
+async def _sha256_hex(content: bytes) -> str:
+    # hashlib releases the GIL: a portrait-sized body is hashed off the event loop.
+    if len(content) > ASSET_LARGE_ENTRY_BYTES:
+        return await asyncio.to_thread(lambda: hashlib.sha256(content).hexdigest())
+    return hashlib.sha256(content).hexdigest()
+
+
 def _disk_lifetime(url: str, ttl_seconds: float) -> tuple[float, bool]:
     """Disk freshness window, and whether a content-addressed host pins it."""
     if ttl_seconds <= 0:
@@ -443,6 +491,38 @@ def _disk_metadata_reusable(
     return bool(meta.etag or meta.modified)
 
 
+def _effective_headers(
+    client: httpx.AsyncClient,
+    url: str,
+    params: Mapping[str, Any] | Sequence[tuple[str, Any]] | None,
+    headers: Mapping[str, str] | None,
+) -> Mapping[str, str]:
+    """The headers ``client.build_request("GET", url, ...)`` would carry, without building it.
+
+    Disk keys hash these, so they must match the builder exactly: the client's
+    default headers, then ``Host``, then the caller's headers. Client cookies
+    (added per domain) and header input the builder would reject or join
+    still go through the real builder.
+    """
+    extra = dict(headers or {})
+    target = httpx.URL(url)
+    if (
+        client.cookies
+        or target.is_relative_url
+        or len({str(name).lower() for name in extra}) != len(extra)
+        or not all(
+            isinstance(name, str) and isinstance(value, str) and name.isascii() and value.isascii()
+            for name, value in extra.items()
+        )
+    ):
+        return client.build_request("GET", url, params=params, headers=headers).headers
+    merged = {name.lower(): value for name, value in client.headers.items()}
+    if target.host:
+        merged["host"] = target.netloc.decode("ascii")
+    merged.update((name.lower(), value) for name, value in extra.items())
+    return merged
+
+
 async def _cache_coordinates(
     url: str,
     *,
@@ -458,9 +538,7 @@ async def _cache_coordinates(
     # publish or reuse those responses using a pre-authentication cache key.
     if client.auth is not None:
         ttl_seconds = 0
-    effective_headers = client.build_request(
-        "GET", url, params=params, headers=headers
-    ).headers
+    effective_headers = _effective_headers(client, url, params, headers)
     key: RequestKey = (
         namespace,
         str(url),
@@ -556,7 +634,7 @@ async def cached_public_resource(
     disk = public_tables if table_eligible else public_images
     disk_ttl, pinned = _disk_lifetime(url, ttl_seconds)
     try:
-        meta = await asyncio.to_thread(disk.metadata, disk_key)
+        meta = await _disk_metadata(disk, disk_key)
         if _disk_metadata_reusable(meta, ttl_seconds=disk_ttl, pinned=pinned):
             return True
         if table_eligible:
@@ -570,12 +648,19 @@ async def cached_public_resource(
             headers=headers,
             ttl_seconds=ttl_seconds,
         ):
-            meta = await asyncio.to_thread(disk.metadata, alias_key)
+            meta = await _disk_metadata(disk, alias_key)
             if _disk_metadata_reusable(meta, ttl_seconds=disk_ttl, pinned=pinned):
                 return True
     except (OSError, sqlite3.Error):
         return False
     return False
+
+
+async def _disk_metadata(disk, key: str) -> DiskImageMeta | None:
+    # A loaded metadata index answers with a dict lookup: no thread hop needed.
+    if getattr(disk, "index_loaded", False):
+        return disk.metadata(key)
+    return await asyncio.to_thread(disk.metadata, key)
 
 
 async def _fetch_resource(
@@ -591,7 +676,10 @@ async def _fetch_resource(
     validator: Callable[[HttpResource], object] | None = None,
     asset: bool = False,
     disk_aliases: Sequence[str] = (),
+    revalidate: bool = False,
 ) -> HttpResource:
+    """``revalidate``: drop the memory copy and ask the server again even when the
+    disk row is still fresh (a conditional request when validators exist)."""
     key, eligible, disk_key, ttl_seconds = await _cache_coordinates(
         url,
         namespace=namespace,
@@ -648,10 +736,12 @@ async def _fetch_resource(
                             break
             except (OSError, sqlite3.Error):
                 _cache_event(key, "disk_errors", 1)
-        if cached is not None:
+        if cached is not None and not revalidate:
             deadline = cached.validated_at + _fresh_for(cached.max_age, disk_ttl, pinned)
             if time.time() < deadline:
                 _cache_event(key, "disk_hits", 1)
+                if response_kind == "bytes" and len(cached.content) > ASSET_LARGE_ENTRY_BYTES:
+                    _cache_event(key, "large_disk_hits", 1)
                 return validate(
                     HttpResource(
                         cached.content,
@@ -659,6 +749,8 @@ async def _fetch_resource(
                         200,
                         url,
                         expires_at=deadline,
+                        digest=cached.digest,
+                        disk_backed=True,
                     )
                 )
         request_headers = dict(headers or {})
@@ -694,6 +786,8 @@ async def _fetch_resource(
                     url,
                     expires_at=time.time() + STALE_RETRY_SECONDS,
                     stale=True,
+                    digest=cached.digest,
+                    disk_backed=True,
                 )
             )
         resource = validate(resource)  # Never persist malformed JSON.
@@ -726,7 +820,8 @@ async def _fetch_resource(
                 # Queued for the background writer: the caller never waits for SQLite.
                 if resource.status_code == 304 and cached is not None:
                     # Same bytes: refresh validators and freshness, keep the stored body.
-                    disk.refresh_later(
+                    digest = cached.digest
+                    stored = disk.refresh_later(
                         row_key,
                         row_namespace,
                         DiskImageMeta(
@@ -735,7 +830,12 @@ async def _fetch_resource(
                         row_generation,
                     )
                 else:
-                    disk.put_later(
+                    # Images get a digest once here (browser asset URLs reuse it);
+                    # the writer then stores it instead of hashing the body again.
+                    digest = (
+                        await _sha256_hex(resource.content) if response_kind == "bytes" else ""
+                    )
+                    stored = disk.put_later(
                         disk_key,
                         namespace,
                         DiskImage(
@@ -745,10 +845,16 @@ async def _fetch_resource(
                             resource.modified,
                             validated_at,
                             max_age,
+                            digest,
                         ),
                         generation,
                     )
-                resource = replace(resource, expires_at=validated_at + max_age)
+                resource = replace(
+                    resource,
+                    expires_at=validated_at + max_age,
+                    digest=digest,
+                    disk_backed=stored,
+                )
             if resource.status_code == 304:
                 _cache_event(key, "not_modified", 1)
                 resource = replace(resource, status_code=200)
@@ -758,7 +864,10 @@ async def _fetch_resource(
         _cache_event(key, "misses", 1)
         return await request()
 
-    resource = await _pool_for(url, response_kind).get_or_create(
+    pool = _pool_for(url, response_kind)
+    if revalidate:
+        await pool.clear(lambda candidate: candidate == key)
+    resource = await pool.get_or_create(
         key,
         request,
         ttl_seconds=ttl_seconds,
@@ -912,6 +1021,8 @@ async def fetch_many_resilient(
     4. 放弃的原因会写进日志，调用方不再只看到「少了几张图」。
     5. 重新校验失败或到点没取到时，有旧磁盘副本就用旧图（stale=True），不算失败。
     6. ``disk_aliases`` 里的命名空间若已存过同一 URL 的磁盘副本，自己缺副本时借用（见 fetch_bytes）。
+    7. 先一次分流：内存命中直接用；磁盘上新鲜的整批一次读出（一次线程切换）；
+       只有剩下的才逐个走 fetch_bytes。每批写一条 ``fetch batch mem= disk= net=`` 日志。
     第一项覆盖**每一个**请求过的 url（失败为 None），第二项只保留最终失败原因，
     调用方既不会悄悄少图，也能决定是否把失败详情带入诊断信息。
     """
@@ -919,9 +1030,18 @@ async def fetch_many_resilient(
         attempts = asset_settings().attempts
     deadline = batch_deadline(budget_seconds)
     unique_urls = tuple(dict.fromkeys(str(url) for url in urls if url))
-    resolved: dict[str, HttpResource] = {}
+    resolved, memory_hits, disk_hits = await _cached_batch(
+        unique_urls,
+        namespace=namespace,
+        headers=headers,
+        ttl_seconds=ttl_seconds,
+        max_bytes=max_bytes,
+        disk_aliases=disk_aliases,
+    )
     failures: dict[str, str] = {}
-    pending = list(unique_urls)
+    pending = [url for url in unique_urls if url not in resolved]
+    network = len(pending)
+    network_started = time.perf_counter()
     expired = False
     for attempt in range(max(1, attempts)):
         if not pending:
@@ -965,6 +1085,7 @@ async def fetch_many_resilient(
             if deadline is not None:
                 delay = min(delay, max(0.0, deadline - time.monotonic()))
             await asyncio.sleep(delay)
+    network_seconds = time.perf_counter() - network_started if network else 0.0
     if failures:
         # 截止时间已到或重新校验失败：有旧磁盘副本的先用旧图，不画空白。
         # 没跑完的请求仍在后台继续，拿到新图后更新缓存，下次渲染就是新的。
@@ -996,7 +1117,129 @@ async def fetch_many_resilient(
             f"failed={len(failures)} stale={stale}{' deadline=hit' if expired else ''}"
             f"{f' detail={summary}' if summary else ''}"
         )
+    if unique_urls:
+        logger.info(
+            f"{log_prefix} fetch batch namespace={namespace} requested={len(unique_urls)} "
+            f"mem={memory_hits} disk={disk_hits} net={network} net_seconds={network_seconds:.3f}"
+        )
     return {url: resolved.get(url) for url in unique_urls}, failures
+
+
+@dataclass(frozen=True, slots=True)
+class _DiskPlan:
+    url: str
+    target: str
+    key: RequestKey
+    ttl_seconds: float
+    # (namespace, disk key): ours first, then the aliases, like _fetch_resource.
+    rows: tuple[tuple[str, str], ...]
+    disk_ttl: float
+    pinned: bool
+
+
+async def _cached_batch(
+    urls: Sequence[str],
+    *,
+    namespace: str,
+    headers: Mapping[str, str] | None,
+    ttl_seconds: float,
+    max_bytes: int,
+    disk_aliases: Sequence[str] = (),
+) -> tuple[dict[str, HttpResource], int, int]:
+    """Serve asset URLs that memory or a fresh disk row already hold: ``(found, mem, disk)``.
+
+    Memory is peeked. Disk rows are judged by the metadata index and read with
+    one ``get_many`` in one thread hop, then published to the pool (large
+    images bypass it). Expired rows, misses and ineligible URLs are left to
+    ``fetch_bytes``, which also handles revalidation.
+    """
+    found: dict[str, HttpResource] = {}
+    memory = 0
+    plans: list[_DiskPlan] = []
+    for url in urls:
+        target = rewrite_asset_url(url)
+        key, eligible, disk_key, ttl = await _cache_coordinates(
+            target,
+            namespace=namespace,
+            response_kind="bytes",
+            params=None,
+            headers=headers,
+            ttl_seconds=ttl_seconds,
+        )
+        if ttl <= 0:
+            continue
+        resource = _pool_for(target, "bytes").peek(key)
+        if resource is not None:
+            if len(resource.content) <= max_bytes:
+                found[url] = resource
+                memory += 1
+            continue  # over this caller's limit: fetch_bytes reports it
+        if not eligible:
+            continue
+        aliases = await _alias_disk_keys(
+            target,
+            disk_aliases,
+            namespace=namespace,
+            response_kind="bytes",
+            params=None,
+            headers=headers,
+            ttl_seconds=ttl,
+        )
+        disk_ttl, pinned = _disk_lifetime(target, ttl)
+        plans.append(
+            _DiskPlan(url, target, key, ttl, ((namespace, disk_key), *aliases), disk_ttl, pinned)
+        )
+    if not plans:
+        return found, memory, 0
+    disk = public_images
+
+    def read() -> tuple[dict[str, tuple[_DiskPlan, str, str]], dict[str, DiskImage]]:
+        now = time.time()
+        chosen: dict[str, tuple[_DiskPlan, str, str]] = {}
+        for plan in plans:
+            for row_namespace, row_key in plan.rows:
+                meta = disk.metadata(row_key)
+                if meta is None:
+                    continue
+                # The first row that exists decides; an expired one needs the network.
+                if now < meta.validated_at + _fresh_for(meta.max_age, plan.disk_ttl, plan.pinned):
+                    chosen[plan.url] = (plan, row_namespace, row_key)
+                break
+        rows = [row_key for _plan, _namespace, row_key in chosen.values()]
+        return chosen, disk.get_many(rows, max_bytes) if rows else {}
+
+    try:
+        chosen, images = await asyncio.to_thread(read)
+    except (OSError, sqlite3.Error):
+        return found, memory, 0
+    hits = 0
+    now = time.time()
+    for url, (plan, row_namespace, row_key) in chosen.items():
+        image = images.get(row_key)
+        if image is None:
+            continue
+        expires_at = image.validated_at + _fresh_for(image.max_age, plan.disk_ttl, plan.pinned)
+        if now >= expires_at:
+            continue
+        resource = HttpResource(
+            image.content,
+            image.content_type,
+            200,
+            plan.target,
+            expires_at=expires_at,
+            digest=image.digest,
+            disk_backed=True,
+        )
+        _cache_event(plan.key, "misses", 1)
+        _cache_event(plan.key, "disk_hits", 1)
+        if row_namespace != namespace:
+            _cache_event(plan.key, "alias_disk_hits", 1)
+        if len(image.content) > ASSET_LARGE_ENTRY_BYTES:
+            _cache_event(plan.key, "large_disk_hits", 1)
+        _pool_for(plan.target, "bytes").put(plan.key, resource, ttl_seconds=plan.ttl_seconds)
+        found[url] = resource
+        hits += 1
+    return found, memory, hits
 
 
 async def _stale_copies(
@@ -1039,20 +1282,24 @@ async def _stale_copies(
     disk = public_images
 
     def read() -> dict[str, HttpResource]:
+        images = disk.get_many(
+            [disk_key for _url, _target, disk_keys in lookups for disk_key in disk_keys],
+            max_bytes,
+        )
         found = {}
         for url, target, disk_keys in lookups:
-            for disk_key in disk_keys:
-                image = disk.get(disk_key, max_bytes)
-                if image is not None:
-                    found[url] = HttpResource(
-                        image.content,
-                        image.content_type,
-                        200,
-                        target,
-                        expires_at=time.time(),
-                        stale=True,
-                    )
-                    break
+            image = next((images[key] for key in disk_keys if key in images), None)
+            if image is not None:
+                found[url] = HttpResource(
+                    image.content,
+                    image.content_type,
+                    200,
+                    target,
+                    expires_at=time.time(),
+                    stale=True,
+                    digest=image.digest,
+                    disk_backed=True,
+                )
         return found
 
     return await asyncio.to_thread(read)
@@ -1068,7 +1315,9 @@ async def fetch_json(
     ttl_seconds: float = DEFAULT_CACHE_TTL_SECONDS,
     max_bytes: int = DEFAULT_MAX_RESOURCE_BYTES,
     read_only: bool = False,
+    revalidate: bool = False,
 ) -> Any:
+    """``revalidate=True`` asks the server again even when memory and disk are fresh."""
     resource = await _fetch_resource(
         url,
         namespace=namespace,
@@ -1081,6 +1330,7 @@ async def fetch_json(
         validator=lambda response: json.loads(
             response.content, object_hook=freeze_json_object
         ),
+        revalidate=revalidate,
     )
     return resource.decoded if read_only else mutable_json(resource.decoded)
 
@@ -1164,11 +1414,11 @@ async def get_http_cache_diagnostics() -> dict[str, Any]:
                 "bytes": stat.bytes,
                 "entries": stat.entries,
                 "capacity_evictions": stat.capacity_evictions,
+                "oversized": stat.oversized,
             }
-            for name, pool, stat in zip(
-                ("api", "tables", "assets"), _cache_pools, stats
-            )
+            for name, pool, stat in zip(_POOL_NAMES, _cache_pools, stats)
         },
+        "large_entry_bytes": ASSET_LARGE_ENTRY_BYTES,
         "namespaces": metrics,
     }
 

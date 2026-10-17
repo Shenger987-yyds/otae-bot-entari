@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ..rendering.health import record_assets
+from ..rendering.health import record_asset_seconds, record_assets
 
 import hashlib
 import html
@@ -10,6 +10,7 @@ import tempfile
 import base64
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Iterable, Mapping
 
 from otae_bot.infrastructure.http.client import fetch_many_resilient
@@ -418,6 +419,7 @@ class _PreparedAssets:
 
 
 async def _prepare_assets(urls: Iterable[Any], *, inline: bool) -> _PreparedAssets:
+    started = perf_counter()
     unique_urls = tuple(
         dict.fromkeys(str(url) for url in urls if isinstance(url, str) and url)
     )
@@ -441,7 +443,8 @@ async def _prepare_assets(urls: Iterable[Any], *, inline: bool) -> _PreparedAsse
         if inline:
             output[url] = f"data:{mime};base64,{base64.b64encode(resource.content).decode('ascii')}"
             continue
-        digest = hashlib.sha256(resource.content).hexdigest()
+        # Disk hits and fresh downloads already carry the digest; hash only when unknown.
+        digest = getattr(resource, "digest", "") or hashlib.sha256(resource.content).hexdigest()
         browser_url = f"https://endfield-account.local/assets/{digest}"
         output[url] = browser_url
         browser_resources[browser_url] = BrowserResource(resource.content, mime)
@@ -466,6 +469,7 @@ async def _prepare_assets(urls: Iterable[Any], *, inline: bool) -> _PreparedAsse
             output[virtual_url] = virtual_url
             browser_resources[virtual_url] = BrowserResource(content, mime)
     record_assets(unique_urls, (url for url, mapped in output.items() if mapped))
+    record_asset_seconds(perf_counter() - started)
     return _PreparedAssets(output, browser_resources)
 
 
