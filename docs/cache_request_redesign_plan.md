@@ -1,6 +1,6 @@
 # 缓存与请求体系改造方案：以查询响应延迟为主矛盾
 
-状态：实施中·第三期（分支 `feat/cache-request-phase3`，基线 `main @ 0c506de`，v1.29.0）。第一期已合入 `main @ ef3ec25`（v1.28.0）并上线沈阳云；第二期已合入 `main`（v1.29.0）；第四期未开始。
+状态：第四期已落地（分支 `feat/cache-request-phase4`，基线 `main @ 53e9f4f`，v1.31.0，未推送、未上线）；§5 四期全部完成，方案收口。第一期已合入 `main @ ef3ec25`（v1.28.0）并上线沈阳云；第二期已合入 `main`（v1.29.0）；第三期已合入 `main`（v1.30.0）。
 
 ## 主人拍板（已定，实施须遵守）
 
@@ -134,6 +134,62 @@ thread-local）：`otae_bot/infrastructure/rendering/browser.py` 改用 Playwrig
   `draw kind=... queue_wait=` ≤ 1 s；`/ef dev status` 浏览器行；Chromium 进程数为 1 个主进程加不超过并发数个
   renderer。
 
+## 第四期落地记录
+
+§5 第四期三项在 `feat/cache-request-phase4` 完成（v1.31.0，未推送、未上线），按主人拍板 **Q2B** 实施。
+AssetBroker、Playwright 与前三期的缓存语义都没动。与方案 / brief 的出入与要点：
+
+- **缓存在 handlers 层，不在 client 层**：`EndfieldOfficialClient.card_detail` 仍然每次请求
+  （`_personal_card_payload` 的「never cache personal response data」不变），`handlers._CARD_DETAIL_CACHE`
+  （`AsyncTTLCache`，TTL 60 s，16 MiB / 64 条，按 JSON 长度计量，不挂 `on_event`）包在外面。key 是
+  `(凭据指纹, role_id, server_id)`；指纹是新抽出的 `account_credential_fingerprint()`，即原 `_skland_context`
+  的 `sha256(provider:token)[:24]`，JSON 编码凭据与同一 token 的裸形式指纹相同，换号（新 token）、换角色都不会
+  命中。只在进程内存，不落盘；`/ef dev status` 的「账号数据」行只给计数。
+- **走缓存的入口**：`_card_detail_with_snapshot`（账号详情、养成、基建、探索）与 `/ef 日常`，两者共用同一份
+  条目，所以「账号 → 日常」第二次也不再请求。奖章缺章与档案进度走 `endfield_card_detail`（完整响应、形状不同、
+  频率低），持有率定时刷新 `_background_card_detail`（`background=True` 的排队语义）都**不读不写**这个缓存。
+  `scripts/benchmark_endfield_account_cache.py` patch 掉了 `_card_detail_with_snapshot`，测不到本期收益。
+- **命中时跳过快照与预取**：持有率快照写入与 `prefetch_detail_assets` 只在真正发了请求的那一次做（并发合并的
+  等待方也不做）。代价：`/ef 日常` 先取到（日常本来就不写快照）、60 s 内再查 `/ef 账号` 时，这次不写持有率快照；
+  快照由下一次未命中或持有率定时刷新补上。
+- **并发语义变化**：同一角色并发的 `card_detail` 查询从「第二个报『当前任务正在处理中』」变成合并等待同一次请求。
+  `ROLE_TASKS.claim` 在 fill 里：命中不占角色锁（抽卡同步进行中也能直接返回缓存），未命中时若该角色正在抽卡同步
+  / 小黑盒导入，所有等待方都收到 `TaskAlreadyRunning`，与现状一致；失败不入缓存，下一次重新请求。fill 跑在缓存
+  自己的任务里，调用方被取消不会取消请求，结果仍入缓存（与 `_CHALLENGE_DATA_CACHE` 相同）。
+- **清理**：仓库里没有字面上的 `/ef dev clear`，`/ef dev cache clear <任意 scope>` 与 `/ef dev refresh <scope>`
+  都会清掉全部条目；`/ef 解绑` 清掉该角色的条目（所有凭据）；换绑不清，新凭据指纹不同，旧条目 60 s 内自然过期；
+  Cleanup 时关闭。被官方吊销的 token，旧 detail 最多留 60 s。
+- **换签排队指标**：`community_context_metrics()` 在原 6 个计数后追加 `lock_waits` / `lock_wait_ms`（排在别的
+  换签后面，后台调用等前台清空也算）、`interval_waits` / `interval_wait_ms`（拿到锁后按 2 s 换签间隔睡）、
+  `exchange_ms`（换签本体，成功失败都计）。与 brief 的出入：「等待锁」只在真的排了队时计次（锁已被占、后台在等前台），
+  不按「耗时 > 0」——锁空闲时 acquire 也有几微秒，按 > 0 会把每次换签都算成等待。每次换签一行
+  `[endfield-community] exchange result=ok|failed lock_wait= interval_wait= exchange= foreground_waiters=`，
+  不带 token、指纹或角色；等锁 + 等间隔超过 4 s（`SKLAND_EXCHANGE_QUEUE_WARN_SECONDS`，即至少两个冷 token 在排队）
+  升为 warning。熔断直接拒绝的不算换签，不打这一行。`/ef dev status` 新增「社区换签」行。持有率刷新的批次日志
+  仍只取原 6 个 key（`_COMMUNITY_METRIC_KEYS` 未改）。
+- **签到保持串行**：`attendance()` 的 POST 与日历 GET 顺序、签名上下文复用都不动，只加计时与一行
+  `[endfield-community] attendance status= post= calendar= calendar_ok=`。不能并行的原因：POST 结果有时缺奖励名，
+  要靠 GET 的 `resourceInfoMap` 补；日历的 `done` 计数要在签完之后读才含今天。
+
+本地验证（开发机 Linux / Python 3.12，不是 em）：
+
+- 新增 `tests/test_endfield_card_detail_cache.py` 20 例（四连查 1 次请求且第二至四次 < 50 ms、凭据指纹与归一化、
+  角色隔离、60 s 过期、并发合并、命中不等角色锁、失败传给所有等待方且不入缓存、各 scope 清理、解绑只清该角色、
+  Cleanup、状态行、日志不含 token 与指纹、日常复用与失败账号重试、日常接账号详情、换签间隔与等锁分开计、后台等前台
+  计入等锁、排队超阈值告警、签到 GET 在 POST 返回后才发）连跑 10 次无失败。brief 的「日常连跑两次共 3 次请求」
+  在其夹具里有一个必失败的账号，实际是 3 + 1 = 4 次（失败账号每次都重新请求），用例按 4 断言。
+- 既有用例：探索「同一快照复用图片」改为 60 s 内 1 次请求、拨钟过 61 s 后 2 次；预取与快照用例两段之间清缓存；
+  换签计数全等改为只比计数键；`test_endfield_account_ui.py` 的账号路由用例（brief 未列出，共用 `"token"` 与固定
+  角色）与 `test_endfield_daily.py` 在 `asyncSetUp` 里清缓存。
+- 全量 `pytest -q`：2398 passed / 2 skipped（加 changelog 条目后）。
+- em 上待核：60 s 内 `/ef 账号` → `/ef 基建` → `/ef 养成` → `/ef 探索`，后三行 `account-render ... data=` ≤ 0.050；
+  `/ef dev status` 的「账号数据」与「社区换签」两行，`/ef dev cache clear all` 后「账号数据: 0 项」；日志目录里
+  token 原文与指纹前 8 位 `grep -c` 均为 0；两个冷 token 同时查时第二行 `exchange result=ok` 的 `lock_wait>0`
+  且 `lock_wait + interval_wait ≈ 2.0`（等锁的那段就是第一个换签的耗时，余下按间隔补足）；`/ef 签到` 的 `attendance` 行。
+
+第四期之后没有必须立刻做的第五期。可选、需主人另行点头的事项：第二期 brief 里的过期行 SWR（2b）、把换签等待
+指标接进持有率刷新的批次日志、奖章 / 档案进度改走同一份 detail。
+
 
 主人原话：「目前的缓存体系需要大改，请求体系也要改」「目前主要问题是各种查询的响应过慢」。
 本文不再打局部补丁（素材通道、整卡预算、磁盘异步写、hycdn 长缓存、namespace 别名、立绘单独计时
@@ -213,7 +269,8 @@ thread-local）：`otae_bot/infrastructure/rendering/browser.py` 改用 Playwrig
 
 1. `card/detail` 每次必取、不缓存（隐私原则，第二轮明确「每次仍请求新的个人数据」）。
    这是对的，但意味着「账号 → 基建 → 养成 → 探索」四连查会打四次同一接口；`ROLE_TASKS.claim`
-   让同一角色的并发请求串行而不是合并。
+   让同一角色的并发请求串行而不是合并。（按 Q2B 已在第四期改为同一凭据同一角色 60 s 内存复用、
+   并发合并，见「第四期落地记录」。）
 2. 签名上下文换签：`_skland_context` 全局一把 `asyncio.Lock` + 2 s 间隔（`SKLAND_EXCHANGE_INTERVAL_SECONDS`），
    TTL 540 s。冷 token 的多个用户同时查，第 N 个要等 (N-1) × 2 s 才开始发第一个请求。
 3. `_card_detail_with_snapshot` 在拿到 detail 后同步 `persist_detail`（解析 + `replace_operator_snapshot`
@@ -412,7 +469,7 @@ hycdn 经代理时不预取（Q4）。
 - `/ef 日常` 多账号改为 `gather`（每角色仍受 `ROLE_TASKS` 与换签间隔约束）。
 - `_skland_context` 的 2 s 间隔只对**换签**生效，这点不变；但把「等待换签」与「等待锁」区分记到指标里，
   便于判断冷 token 排队是否是问题。
-- `card_detail` 的结果是否允许 30–60 s 内存复用：**不在默认方案内**，见 Q2。
+- `card_detail` 的结果是否允许 30–60 s 内存复用：**不在默认方案内**，见 Q2（主人拍板 Q2B，第四期落地）。
 
 ### 4.4 模块与职责
 
