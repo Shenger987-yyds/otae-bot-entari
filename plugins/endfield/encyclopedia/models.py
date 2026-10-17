@@ -143,6 +143,16 @@ class EnemyResistanceView:
 
 
 @dataclass(slots=True)
+class EnemyStatView:
+    """一个等级节点上的基础数值；属性类型与关卡卡同口径（0 等级 / 1 生命 / 2 攻击 / 3 防御）。"""
+
+    level: int
+    hp: int | None = None
+    attack: int | None = None
+    defense: int | None = None
+
+
+@dataclass(slots=True)
 class EnemyView:
     template_id: str
     name: str = ""
@@ -157,6 +167,10 @@ class EnemyView:
     distributions: tuple[str, ...] = ()
     distribution_count: int = 0
     variant_count: int = 0
+    stats: tuple[EnemyStatView, ...] = ()
+    stat_node_count: int = 0
+    poise: int | None = None
+    tower_attack: float | None = None
     source: str = "akedata"
     revision: str = ""
 

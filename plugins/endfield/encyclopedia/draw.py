@@ -42,7 +42,9 @@ from .models import (
     TermView,
 )
 
+# 版心不写死：卡片按内容撑开，只留上下限。
 CARD_WIDTH = 1240
+CARD_MIN_WIDTH = 640
 CARD_MAX_HEIGHT = 12000
 # 与 ARCHIVE_PAGE_BUDGETS 同数值，故意不 import。
 CATALOG_PAGE_BUDGETS: tuple[int, ...] = (24, 18, 12, 6)
@@ -220,8 +222,33 @@ def render_enemy_html(view: EnemyView, urls: Mapping[str, str]) -> str:
             ("类型", view.display_type_name),
             ("实例", f"{view.variant_count} 个" if view.variant_count else ""),
             ("别名", view.nickname),
+            ("韧性", str(view.poise) if view.poise else ""),
+            ("对塔攻击", _number_text(view.tower_attack)),
         ]
     )
+    if view.stats:
+        rows = "".join(
+            "<div class='stat-row'>"
+            f"<b>Lv{stat.level}</b>"
+            f"<span>{_stat_number(stat.hp)}</span>"
+            f"<span>{_stat_number(stat.attack)}</span>"
+            f"<span>{_stat_number(stat.defense)}</span></div>"
+            for stat in view.stats
+        )
+        stats_body = (
+            "<div class='stat-table'><div class='stat-head'>"
+            "<span>等级</span><span>生命</span><span>攻击</span><span>防御</span></div>"
+            f"{rows}</div>"
+        )
+        stats_meta = (
+            f"{len(view.stats)} / {view.stat_node_count} 个节点"
+            if view.stat_node_count > len(view.stats)
+            else f"{view.stat_node_count} 个节点"
+        )
+    else:
+        # 没有唯一属性模板时整段省略：抗性段已经说明了「N 种属性模板」。
+        stats_body = ""
+        stats_meta = ""
     if view.resistances:
         resist = "<div class='resist-strip'>" + "".join(
             f"<div class='resist-cell' style='--el:#{item.color or '8a9296'}'>"
@@ -244,6 +271,7 @@ def render_enemy_html(view: EnemyView, urls: Mapping[str, str]) -> str:
         for index, item in enumerate(view.abilities, start=1)
     )
     sections = [
+        *([("等级成长", stats_body, stats_meta)] if view.stats else []),
         ("抗性", resist, resist_meta),
         ("能力", abilities or "<p class='muted'>暂无能力说明</p>", _count_meta(view.abilities)),
         (
@@ -376,7 +404,7 @@ async def _render(
             output = await screenshot_web_element(
                 html_path.resolve().as_uri(),
                 ".ency-card",
-                viewport=(CARD_WIDTH, 1),
+                viewport=(CARD_MIN_WIDTH, 1),
                 timeout_ms=25000,
                 max_height=CARD_MAX_HEIGHT,
                 device_scale_factor=1.25,
@@ -446,47 +474,48 @@ def _paginate(
 
 _BASE_CSS = """
 *{box-sizing:border-box}
-html,body{margin:0;width:__pagew__;background:#e5e7e1;color:#15191d;
+html,body{margin:0;background:#e5e7e1;color:#15191d;
   font-family:'Microsoft YaHei','PingFang SC','Noto Sans SC',Arial,sans-serif}
 body{padding:0;
   background-image:linear-gradient(90deg,rgba(21,25,29,.045) 1px,transparent 1px),
     linear-gradient(0deg,rgba(21,25,29,.045) 1px,transparent 1px);
   background-size:40px 40px}
-.ency-card{width:__pagew__;min-height:520px;padding:__pad__}
-.sheet{position:relative;width:__cardw__;overflow:hidden;background:#fbfbf7;
+.ency-card{width:max-content;min-width:__minw__;max-width:__maxw__;min-height:520px;padding:__pad__}
+.sheet{position:relative;overflow:hidden;background:#fbfbf7;
   border:1px solid #c2c6c0;box-shadow:0 10px 22px rgba(18,22,26,.1)}
 .hero{position:relative;display:flex;align-items:flex-start;justify-content:space-between;gap:26px;
-  padding:26px 30px 24px 34px;border-bottom:1px solid #c2c6c0;
-  background:repeating-linear-gradient(90deg,rgba(21,25,29,.04) 0 1px,transparent 1px 9px),
-    linear-gradient(180deg,#f5f6f1,#e9ebe4)}
+  padding:26px 30px 24px 34px;border-bottom:1px solid #0e1316;color:#fff;
+  background:repeating-linear-gradient(90deg,rgba(255,255,255,.045) 0 1px,transparent 1px 9px),
+    linear-gradient(180deg,#272e33,#1a2024)}
 .hero::before{content:'';position:absolute;left:0;top:0;bottom:0;width:10px;background:var(--accent)}
 .hero-main{position:relative;flex:1;min-width:0}
 .hero-kicker{display:flex;align-items:center;gap:10px;font-size:11px;font-weight:900;
-  letter-spacing:.26em;color:#6c746f}
+  letter-spacing:.26em;color:rgba(255,255,255,.6)}
 .kicker-mark{width:16px;height:4px;background:var(--accent);display:block;flex:none}
-.kicker-tag{margin-left:2px;padding:3px 8px;background:#15191d;color:#fff;font-size:10.5px;
+.kicker-tag{margin-left:2px;padding:3px 8px;background:var(--accent);color:#15191d;font-size:10.5px;
   font-weight:900;letter-spacing:.16em}
 .hero h1{margin:13px 0 0;font-size:46px;line-height:1.04;font-weight:950;letter-spacing:-.01em;
-  overflow-wrap:anywhere}
-.hero-id{margin-top:11px;font:700 13px/1.2 Consolas,'SFMono-Regular',monospace;color:#79817c;
-  letter-spacing:.05em;overflow-wrap:anywhere}
+  color:#fff;overflow-wrap:anywhere}
+.hero-id{margin-top:11px;font:700 13px/1.2 Consolas,'SFMono-Regular',monospace;
+  color:rgba(255,255,255,.52);letter-spacing:.05em;overflow-wrap:anywhere}
 .hero-side{position:relative;display:flex;align-items:flex-start;gap:18px;flex:none}
 .hero-figure{display:flex;flex-direction:column;align-items:center;gap:10px}
-.hero-icon{width:112px;height:112px;object-fit:contain;padding:9px;background:#fff;
-  border:1px solid #b9beb8;box-shadow:inset 0 0 0 4px #f2f3ee}
+.hero-icon{width:112px;height:112px;object-fit:contain;padding:9px;background:rgba(255,255,255,.07);
+  border:1px solid rgba(255,255,255,.2);box-shadow:inset 0 0 0 4px rgba(255,255,255,.06)}
 .hero-icon.placeholder{display:flex;align-items:center;justify-content:center;
-  font:950 40px/1 'Arial Black',Arial;color:var(--accent);opacity:.8}
+  font:950 40px/1 'Arial Black',Arial;color:var(--accent);opacity:.9}
 .rarity{display:flex;flex-direction:column;align-items:center;gap:7px}
 .rarity-pips{display:flex;gap:6px}
 .rarity-pips i{width:9px;height:9px;transform:rotate(45deg);background:var(--rarity,#8d9598)}
-.rarity span{font-size:10.5px;font-weight:900;letter-spacing:.14em;color:#79817c}
+.rarity span{font-size:10.5px;font-weight:900;letter-spacing:.14em;color:rgba(255,255,255,.55)}
 .count-block,.page-block{display:flex;flex-direction:column;align-items:flex-end;gap:4px;
-  padding:10px 16px;border:1px solid #c2c6c0;background:#fff}
-.count-block b{font:950 40px/1 'Arial Black',Arial;letter-spacing:-.02em}
-.count-block span,.page-block span{font-size:10.5px;font-weight:900;letter-spacing:.16em;color:#79817c}
-.page-block{background:#15191d;border-color:#15191d;color:#fff}
+  padding:10px 16px;border:1px solid rgba(255,255,255,.22);background:rgba(255,255,255,.07)}
+.count-block b{font:950 40px/1 'Arial Black',Arial;letter-spacing:-.02em;color:#fff}
+.count-block span,.page-block span{font-size:10.5px;font-weight:900;letter-spacing:.16em;
+  color:rgba(255,255,255,.6)}
+.page-block{background:var(--accent);border-color:var(--accent);color:#15191d}
 .page-block b{font:950 26px/1 'Arial Black',Arial}
-.page-block span{color:#cfd5d8}
+.page-block span{color:rgba(21,25,29,.6)}
 .hero-rule{height:7px;background:repeating-linear-gradient(135deg,var(--accent) 0 7px,rgba(21,25,29,.16) 7px 14px)}
 .spec{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(180px,max-content);
   justify-content:start;background:#fff;border-bottom:1px solid #d8dbd5}
@@ -526,6 +555,16 @@ p.deco{margin-top:12px;padding:11px 14px;border-left:3px solid #d3d7d1;backgroun
 .spec-row:last-child{border-bottom:none}
 .spec-row span{font-size:13px;font-weight:900;letter-spacing:.1em;color:#79817c}
 .spec-row b{font:950 17px/1.2 Consolas,'SFMono-Regular',monospace;color:#15191d}
+.stat-table{border:1px solid #dcdfd9;background:#fff}
+.stat-head,.stat-row{display:grid;grid-template-columns:96px 1fr 1fr 1fr;align-items:baseline;
+  column-gap:16px;padding:10px 16px}
+.stat-head{background:#f1f2ed;border-bottom:1px solid #dcdfd9;font-size:11px;font-weight:900;
+  letter-spacing:.14em;color:#79817c}
+.stat-head span:not(:first-child){text-align:right}
+.stat-row{border-bottom:1px dashed #e6e9e3}
+.stat-row:last-child{border-bottom:none}
+.stat-row b{font:950 15px/1.3 Consolas,'SFMono-Regular',monospace;letter-spacing:.02em}
+.stat-row span{font:900 17px/1.3 Consolas,'SFMono-Regular',monospace;text-align:right;color:#232a30}
 .resist-strip{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px}
 .resist-cell{border:1px solid #d3d7d1;background:#fff}
 .resist-cell .bar{height:6px;background:var(--el,#8a9296)}
@@ -559,7 +598,7 @@ p.deco{margin-top:12px;padding:11px 14px;border-left:3px solid #d3d7d1;backgroun
 .group-bar i{display:block;height:100%;background:var(--accent)}
 .hint{padding:13px 16px;border:1px dashed #cfd3cd;background:#f5f6f1;font-size:14px;
   font-weight:850;color:#6f7773}
-.catalog-grid{display:grid;grid-template-columns:repeat(var(--cols,6),minmax(0,1fr));gap:9px}
+.catalog-grid{display:grid;grid-template-columns:repeat(var(--cols,6),minmax(176px,1fr));gap:9px}
 .catalog-item{position:relative;min-height:68px;padding:11px 13px 11px 16px;background:#fff;
   border:1px solid #d6dad4}
 .catalog-item::before{content:'';position:absolute;left:0;top:0;bottom:0;width:4px;
@@ -578,8 +617,8 @@ footer .mono{font-family:Consolas,'SFMono-Regular',monospace;letter-spacing:.04e
 
 def _css() -> str:
     return (
-        _BASE_CSS.replace("__pagew__", f"{CARD_WIDTH}px")
-        .replace("__cardw__", f"{CARD_WIDTH - _PAGE_PADDING * 2}px")
+        _BASE_CSS.replace("__minw__", f"{CARD_MIN_WIDTH}px")
+        .replace("__maxw__", f"{CARD_WIDTH}px")
         .replace("__pad__", f"{_PAGE_PADDING}px")
     )
 
@@ -667,6 +706,8 @@ def _catalog_groups(view: EncyclopediaCatalogView) -> str:
     """一组一段；多组才画占比条，整页没有图标时不逐组重复同一句提示。"""
     total = max(1, view.total)
     show_share = len(view.groups) > 1
+    # 列数跟着最大组走，条目少的目录不会被 6 列撑到满宽。
+    columns = min(CATALOG_COLUMNS, max((len(g.items) for g in view.groups), default=0) or 1)
     counter = 0
     blocks: list[str] = []
     for group in view.groups:
@@ -678,7 +719,7 @@ def _catalog_groups(view: EncyclopediaCatalogView) -> str:
                 counter += 1
                 tiles.append(_catalog_item(item, counter))
             body = (
-                f'<div class="catalog-grid" style="--cols:{CATALOG_COLUMNS}">'
+                f'<div class="catalog-grid" style="--cols:{columns}">'
                 f"{''.join(tiles)}</div>"
             )
         meta = f'<span class="group-meta">{share}%</span>' if show_share else ""
@@ -752,6 +793,14 @@ def _count(value: int | None) -> str:
 
 def _percent(value: float | None) -> str:
     return f"{value:g}%" if value is not None else "—"
+
+
+def _stat_number(value: int | None) -> str:
+    return f"{value:,}" if value is not None else "—"
+
+
+def _number_text(value: float | None) -> str:
+    return f"{value:g}" if value else ""
 
 
 def _multiline(value: str) -> str:
