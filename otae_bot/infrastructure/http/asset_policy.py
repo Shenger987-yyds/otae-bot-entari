@@ -29,6 +29,8 @@ _PROXY_SCHEMES = ("http", "https", "socks5", "socks5h")
 PROXY_MODES = ("always", "fallback")
 # 内容地址固定（路径带哈希）的图床：磁盘缓存按这里的秒数算新鲜期，不再每 10 分钟校验。
 DEFAULT_HOST_MAX_AGE = (("hycdn.cn", 7 * 86400.0),)
+# 按主机的并发上限（在总并发之内再分）：慢图床占不满全部槽位，其余主机照常下载。
+DEFAULT_HOST_CONCURRENCY = (("hycdn.cn", 4), ("fz.wiki", 2), ("warfarin.wiki", 2))
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +51,14 @@ class AssetFetchSettings:
     trust_env: bool = False
     host_rewrites: tuple[tuple[str, str], ...] = ()
     host_max_age: tuple[tuple[str, float], ...] = DEFAULT_HOST_MAX_AGE
+    host_concurrency: tuple[tuple[str, int], ...] = DEFAULT_HOST_CONCURRENCY
+    # 软截止（整卡预算）到点后没下完的素材转入后台续传；续传到这个秒数仍未完成才取消。
+    hard_deadline: float = 180.0
+    # 网络队列里未完成的下载超过这个数时，新的预取直接丢弃（交互与续传不受限）。
+    queue_limit: int = 2000
+    # 预取（只写磁盘）每个自然日（北京时间）最多下载这么多 MB；304 不计。
+    prefetch_daily_mb: int = 300
+    prefetch: bool = True
 
     @property
     def attempts(self) -> int:
@@ -160,6 +170,30 @@ def _host_max_age(raw: str, default) -> tuple[tuple[str, float], ...]:
     return tuple(pairs.items())
 
 
+def _host_concurrency(raw: str, default) -> tuple[tuple[str, int], ...]:
+    """``hycdn.cn=4,fz.wiki=2``；按主机后缀匹配，``off`` 表示只受总并发限制。"""
+    raw = raw.strip()
+    if not raw:
+        return default
+    if raw.lower() in {"off", "none", "0"}:
+        return ()
+    pairs: dict[str, int] = {}
+    for item in raw.replace(";", ",").split(","):
+        suffix, sep, limit = item.partition("=")
+        suffix = suffix.strip().lower().lstrip("*.").rstrip(".")
+        try:
+            value = int(limit) if sep and suffix else None
+        except ValueError:
+            value = None
+        if value is None or value < 1:
+            logger.warning(
+                f"[http-assets] {ENV_PREFIX}HOST_CONCURRENCY entry ignored: {item.strip()[:64]}"
+            )
+            continue
+        pairs[suffix] = min(value, 64)
+    return tuple(pairs.items())
+
+
 def load_asset_settings(environ: Mapping[str, str] | None = None) -> AssetFetchSettings:
     env = os.environ if environ is None else environ
     defaults = AssetFetchSettings()
@@ -180,6 +214,15 @@ def load_asset_settings(environ: Mapping[str, str] | None = None) -> AssetFetchS
         host_max_age=_host_max_age(
             str(env.get(ENV_PREFIX + "HOST_MAX_AGE", "") or ""), defaults.host_max_age
         ),
+        host_concurrency=_host_concurrency(
+            str(env.get(ENV_PREFIX + "HOST_CONCURRENCY", "") or ""), defaults.host_concurrency
+        ),
+        hard_deadline=_number(env, "HARD_DEADLINE", defaults.hard_deadline, float, 1.0, 3600.0),
+        queue_limit=_number(env, "QUEUE_LIMIT", defaults.queue_limit, int, 0, 100000),
+        prefetch_daily_mb=_number(
+            env, "PREFETCH_DAILY_MB", defaults.prefetch_daily_mb, int, 0, 100000
+        ),
+        prefetch=_flag(env, "PREFETCH", defaults.prefetch),
     )
 
 
@@ -227,6 +270,19 @@ def host_max_age(host: str, settings: AssetFetchSettings | None = None) -> float
         ):
             best = (suffix, seconds)
     return None if best is None else best[1]
+
+
+def host_concurrency(host: str, settings: AssetFetchSettings | None = None) -> int:
+    """Concurrent requests allowed to ``host`` (longest suffix wins), within the total."""
+    settings = settings or asset_settings()
+    host = (host or "").lower().rstrip(".")
+    best: tuple[str, int] | None = None
+    for suffix, limit in settings.host_concurrency:
+        if (host == suffix or host.endswith("." + suffix)) and (
+            best is None or len(suffix) > len(best[0])
+        ):
+            best = (suffix, limit)
+    return settings.concurrency if best is None else min(best[1], settings.concurrency)
 
 
 def proxied_host(host: str, settings: AssetFetchSettings | None = None) -> bool:

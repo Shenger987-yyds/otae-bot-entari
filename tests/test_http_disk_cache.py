@@ -19,6 +19,7 @@ from unittest import mock
 import httpx
 
 from otae_bot.infrastructure.http import asset_policy
+from otae_bot.infrastructure.http import assets as http_assets
 from otae_bot.infrastructure.http import client as http_client
 from otae_bot.infrastructure.http import disk as disk_module
 from otae_bot.infrastructure.http.asset_policy import (
@@ -554,6 +555,8 @@ class ClientRevalidationTests(unittest.IsolatedAsyncioTestCase):
         self.patches = [
             mock.patch.object(http_client, "public_images", self.disk),
             mock.patch.object(http_client, "DEADLINE_GRACE_SECONDS", 0.05),
+            # 截止后续传的慢请求不必等满 10 s 才关闭。
+            mock.patch.object(http_assets, "CLOSE_WAIT_SECONDS", 0.05),
         ]
         for patcher in self.patches:
             patcher.start()
@@ -672,7 +675,7 @@ class ClientRevalidationTests(unittest.IsolatedAsyncioTestCase):
         slow = True
         missing = AKE_URL.format("not-on-disk")
         started = time.monotonic()
-        with mock.patch.object(http_client, "logger") as log:
+        with mock.patch.object(http_assets, "logger") as log:
             results, failures = await http_client.fetch_many_resilient(
                 [*urls, missing], namespace=NAMESPACE, budget_seconds=0.3
             )

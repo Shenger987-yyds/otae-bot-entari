@@ -12,6 +12,7 @@ from unittest import mock
 import httpx
 
 from otae_bot.infrastructure.cache import AsyncTTLCache
+from otae_bot.infrastructure.http import assets as http_assets
 from otae_bot.infrastructure.http import client as http_client
 from otae_bot.infrastructure.http import tls
 from otae_bot.infrastructure.http.asset_policy import (
@@ -506,7 +507,7 @@ class BatchPartitionTests(_DiskBackedCase):
         with (
             mock.patch.object(self.images, "get", side_effect=AssertionError("per-key disk read")),
             mock.patch.object(self.images, "get_many", side_effect=real_get_many) as get_many,
-            mock.patch.object(http_client, "logger") as log,
+            mock.patch.object(http_assets, "logger") as log,
         ):
             results, failures = await http_client.fetch_many_resilient(urls, namespace="endfield-assets")
             third, _ = await http_client.fetch_many_resilient(urls, namespace="endfield-assets")
@@ -527,7 +528,7 @@ class BatchPartitionTests(_DiskBackedCase):
         cached, missing = AKE_IMAGE.format("expired"), AKE_IMAGE.format("missing")
         await http_client.fetch_bytes(cached, namespace="endfield-assets", asset=True)
         await self.forget_memory()
-        with mock.patch.object(http_client, "logger") as log:
+        with mock.patch.object(http_assets, "logger") as log:
             results, failures = await http_client.fetch_many_resilient(
                 [cached, missing, "https://assets.invalid/x.png"], namespace="endfield-assets", attempts=1
             )

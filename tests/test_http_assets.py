@@ -18,6 +18,7 @@ import httpcore
 import httpx
 
 from otae_bot.infrastructure.http import asset_policy
+from otae_bot.infrastructure.http import assets as http_assets
 from otae_bot.infrastructure.http import client as http_client
 from otae_bot.infrastructure.http.asset_policy import (
     AssetFetchSettings,
@@ -431,10 +432,14 @@ class AssetLaneTests(unittest.IsolatedAsyncioTestCase):
         await http_client.close_http_client()
         self.grace = mock.patch.object(http_client, "DEADLINE_GRACE_SECONDS", 0.05)
         self.grace.start()
+        # 截止后续传的慢请求不必等满 10 s 才关闭。
+        self.close_wait = mock.patch.object(http_assets, "CLOSE_WAIT_SECONDS", 0.05)
+        self.close_wait.start()
 
     async def asyncTearDown(self):
-        self.grace.stop()
         await http_client.close_http_client()
+        self.grace.stop()
+        self.close_wait.stop()
 
     def _install(self, *, asset_handler, api_handler=None, settings: AssetFetchSettings | None = None):
         configure_asset_settings(settings or AssetFetchSettings())
@@ -648,6 +653,9 @@ class CardDeadlineTests(unittest.IsolatedAsyncioTestCase):
         await http_client.close_http_client()
         self.grace = mock.patch.object(http_client, "DEADLINE_GRACE_SECONDS", 0.05)
         self.grace.start()
+        # 截止后续传的慢请求不必等满 10 s 才关闭。
+        self.close_wait = mock.patch.object(http_assets, "CLOSE_WAIT_SECONDS", 0.05)
+        self.close_wait.start()
 
         async def handler(request):
             if request.url.host == "slow.test":
@@ -658,8 +666,9 @@ class CardDeadlineTests(unittest.IsolatedAsyncioTestCase):
         http_client._asset_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
     async def asyncTearDown(self):
-        self.grace.stop()
         await http_client.close_http_client()
+        self.grace.stop()
+        self.close_wait.stop()
 
     async def test_endfield_cards_prepare_assets_stops_at_budget(self):
         from plugins.endfield.rendering import cards
