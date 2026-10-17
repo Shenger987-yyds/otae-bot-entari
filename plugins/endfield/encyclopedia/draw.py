@@ -49,7 +49,7 @@ CARD_MAX_HEIGHT = 12000
 # 与 ARCHIVE_PAGE_BUDGETS 同数值，故意不 import。
 CATALOG_PAGE_BUDGETS: tuple[int, ...] = (24, 18, 12, 6)
 CATALOG_COLUMNS = 6
-_PAGE_PADDING = 18
+_PAGE_PADDING = 26
 
 _OVERFLOW_SELECTORS = (".ency-section", ".entry", ".catalog-item", ".ability", ".resist-cell")
 _CATALOG_OVERFLOW_SELECTORS = (".catalog-group", ".catalog-item")
@@ -164,7 +164,6 @@ def render_item_html(view: ItemView, urls: Mapping[str, str]) -> str:
             title=view.name,
             subtitle=view.item_id,
             icon_url=urls.get(view.icon_url, ""),
-            rarity=view.rarity,
             facts=facts,
         ),
         _sections(sections),
@@ -177,6 +176,7 @@ def render_prop_html(view: PropView, urls: Mapping[str, str]) -> str:
     facts = _spec(
         [
             ("类型", view.type_name),
+            ("稀有度", str(view.rarity) if view.rarity else ""),
             ("分桶", "" if view.bucket == view.type_name else view.bucket),
             ("效果", _count_meta(view.effect_lines)),
         ]
@@ -207,7 +207,6 @@ def render_prop_html(view: PropView, urls: Mapping[str, str]) -> str:
             title=view.name,
             subtitle=view.item_id,
             icon_url=urls.get(view.icon_url, ""),
-            rarity=view.rarity,
             facts=facts,
         ),
         _sections(sections),
@@ -482,7 +481,7 @@ body{padding:0;
   background-size:40px 40px}
 .ency-card{width:max-content;min-width:__minw__;max-width:__maxw__;min-height:520px;padding:__pad__}
 .sheet{position:relative;overflow:hidden;background:#f7f8f4;
-  border:1px solid rgba(23,27,31,.28);box-shadow:0 10px 22px rgba(18,22,26,.1)}
+  border:1px solid rgba(23,27,31,.28);box-shadow:0 2px 6px rgba(18,22,26,.07)}
 .hero{position:relative;display:flex;align-items:flex-start;justify-content:space-between;gap:26px;
   padding:26px 30px 24px 34px;color:#fff;background:#171b1f}
 .hero::before{content:'';position:absolute;left:0;top:0;bottom:0;width:10px;background:var(--accent)}
@@ -502,10 +501,6 @@ body{padding:0;
   border:1px solid rgba(255,255,255,.2);box-shadow:inset 0 0 0 4px rgba(255,255,255,.06)}
 .hero-icon.placeholder{display:flex;align-items:center;justify-content:center;
   font:950 40px/1 'Arial Black',Arial;color:var(--accent);opacity:.9}
-.rarity{display:flex;flex-direction:column;align-items:center;gap:7px}
-.rarity-pips{display:flex;gap:6px}
-.rarity-pips i{width:9px;height:9px;transform:rotate(45deg);background:var(--rarity,#8d9598)}
-.rarity span{font-size:10.5px;font-weight:900;letter-spacing:.14em;color:rgba(255,255,255,.55)}
 .count-block,.page-block{display:flex;flex-direction:column;align-items:flex-end;gap:4px;
   padding:10px 16px;border:1px solid rgba(255,255,255,.22);background:rgba(255,255,255,.07)}
 .count-block b{font:950 40px/1 'Arial Black',Arial;letter-spacing:-.02em;color:#fff}
@@ -637,21 +632,12 @@ def _hero(
     subtitle: str,
     icon_url: str,
     facts: str = "",
-    rarity: int = 0,
 ) -> str:
     icon = (
         f'<img class="hero-icon" src="{_attr(icon_url)}" alt="">'
         if icon_url
         else f'<div class="hero-icon placeholder">{_escape(kind_cn[:1])}</div>'
     )
-    rarity_html = ""
-    if rarity:
-        color = _RARITY_COLORS.get(rarity, _RARITY_FALLBACK)
-        pips = "".join("<i></i>" for _ in range(max(1, min(rarity, 6))))
-        rarity_html = (
-            f'<div class="rarity" style="--rarity:{color}">'
-            f'<div class="rarity-pips">{pips}</div><span>稀有度 {rarity}</span></div>'
-        )
     return f"""
     <header class="hero">
       <div class="hero-main">
@@ -660,7 +646,7 @@ def _hero(
         <div class="hero-id">{_escape(subtitle)}</div>
       </div>
       <div class="hero-side">
-        <div class="hero-figure">{icon}{rarity_html}</div>
+        <div class="hero-figure">{icon}</div>
       </div>
     </header>
 {facts}"""
