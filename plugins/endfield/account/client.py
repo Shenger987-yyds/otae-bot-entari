@@ -41,6 +41,8 @@ SKLAND_REFRESH_USER_AGENT = (
 )
 SKLAND_CONTEXT_TTL_SECONDS = 540
 SKLAND_EXCHANGE_INTERVAL_SECONDS = 2.0
+# 一次换签排队（等锁 + 等间隔）超过它，说明至少两个冷 token 在排队，换签日志升为 warning。
+SKLAND_EXCHANGE_QUEUE_WARN_SECONDS = 4.0
 _SKLAND_CONTEXT_RETRY_CODES = {"401", "10000", "10003"}
 _SKLAND_SYSTEMIC_OPERATIONS = {"账号授权", "获取社区凭据", "刷新社区签名"}
 _SKLAND_SYSTEMIC_CODES = {"405", "429", "502", "503", "504"}
@@ -266,6 +268,12 @@ class EndfieldOfficialClient:
             "exchange_succeeded": 0,
             "exchange_failed": 0,
             "circuit_rejections": 0,
+            # 等待锁：排在别的换签（或前台换签）后面；等待间隔：拿到锁后按换签间隔睡。
+            "lock_waits": 0,
+            "lock_wait_ms": 0,
+            "interval_waits": 0,
+            "interval_wait_ms": 0,
+            "exchange_ms": 0,
         }
         self._u8_cache: dict[tuple[str, str], tuple[str, float]] = {}
 
@@ -389,6 +397,7 @@ class EndfieldOfficialClient:
         rewards: list[AttendanceReward] = []
         award_entries: list[tuple[Any, dict[str, Any]]] = []
         reward_maps: list[Any] = []
+        post_started = time.perf_counter()
         try:
             payload = await self._signed_skland_request(
                 context, "POST", "/web/v1/game/endfield/attendance", raw_body="", extra_headers=headers
@@ -405,10 +414,15 @@ class EndfieldOfficialClient:
                 award_entries = _attendance_award_entries(data.get("awardIds"))
                 reward_maps.append(data.get("resourceInfoMap"))
                 rewards = _attendance_rewards(award_entries, reward_maps)
+        post_seconds = time.perf_counter() - post_started
 
         monthly_count: int | None = None
         calendar_days: int | None = None
         milestones: tuple[AttendanceMilestone, ...] = ()
+        # 日历 GET 必须等 POST 返回后再发，不能并行：POST 结果有时缺奖励名，要靠 GET 的
+        # resourceInfoMap 补；日历的 done 也只有签完之后读才含今天。
+        calendar_started = time.perf_counter()
+        calendar_ok = False
         try:
             calendar_payload = await self._signed_skland_request(
                 context, "GET", "/web/v1/game/endfield/attendance", extra_headers=headers
@@ -416,6 +430,7 @@ class EndfieldOfficialClient:
         except EndfieldAPIError:
             pass
         else:
+            calendar_ok = True
             calendar_data = calendar_payload.get("data") or {}
             calendar = calendar_data.get("calendar") if isinstance(calendar_data, dict) else None
             if isinstance(calendar_data, dict):
@@ -431,6 +446,11 @@ class EndfieldOfficialClient:
                 )
                 calendar_days = len(calendar)
                 milestones = _attendance_diamond_milestones(calendar, reward_maps)
+        logger.info(
+            f"[endfield-community] attendance status={status} post={post_seconds:.3f} "
+            f"calendar={time.perf_counter() - calendar_started:.3f} "
+            f"calendar_ok={str(calendar_ok).lower()}"
+        )
         return AttendanceResult(
             status, message, tuple(rewards), monthly_count, calendar_days, milestones
         )
@@ -852,16 +872,26 @@ class EndfieldOfficialClient:
             self._skland_foreground_ready.clear()
             foreground_registered = True
         try:
+            # 只把真的排了队的算作「等待锁」：锁空闲时 acquire 立刻返回，不计次数。
+            lock_started = time.monotonic()
+            queued = False
             while True:
                 if background:
+                    queued = queued or not self._skland_foreground_ready.is_set()
                     await self._skland_foreground_ready.wait()
+                queued = queued or self._skland_exchange_lock.locked()
                 await self._skland_exchange_lock.acquire()
                 lock_acquired = True
                 if not background or self._skland_foreground_waiters == 0:
                     break
                 self._skland_exchange_lock.release()
                 lock_acquired = False
+                queued = True
                 await asyncio.sleep(0)
+            lock_wait = time.monotonic() - lock_started
+            if queued:
+                self._skland_metrics["lock_waits"] += 1
+                self._skland_metrics["lock_wait_ms"] += int(lock_wait * 1000)
 
             # Another role using the same binding may have filled the cache while
             # this coroutine was waiting for the exchange gate.  For a forced
@@ -883,17 +913,23 @@ class EndfieldOfficialClient:
                     "官方请求过于频繁，请稍候再试。",
                     retry_after_seconds=blocked_for,
                 )
-            delay = self._next_skland_exchange_at - time.monotonic()
-            if delay > 0:
-                await asyncio.sleep(delay)
+            interval_wait = max(0.0, self._next_skland_exchange_at - time.monotonic())
+            if interval_wait > 0:
+                self._skland_metrics["interval_waits"] += 1
+                self._skland_metrics["interval_wait_ms"] += int(interval_wait * 1000)
+                await asyncio.sleep(interval_wait)
             self._next_skland_exchange_at = (
                 time.monotonic() + self._skland_exchange_interval_seconds
             )
             self._skland_metrics["exchange_attempts"] += 1
+            exchange_started = time.monotonic()
             try:
                 context = await self._create_skland_context(account_token, provider, config)
             except EndfieldAPIError as exc:
                 self._skland_metrics["exchange_failed"] += 1
+                self._log_skland_exchange(
+                    "failed", lock_wait, interval_wait, time.monotonic() - exchange_started
+                )
                 cooldown = _skland_systemic_cooldown(exc)
                 if cooldown > 0:
                     self._skland_exchange_blocked_until = time.monotonic() + cooldown
@@ -905,6 +941,9 @@ class EndfieldOfficialClient:
                     )
                 raise
             self._skland_metrics["exchange_succeeded"] += 1
+            self._log_skland_exchange(
+                "ok", lock_wait, interval_wait, time.monotonic() - exchange_started
+            )
             recovered_from = self._skland_exchange_blocked_error
             self._skland_exchange_blocked_until = 0.0
             self._skland_exchange_blocked_error = None
@@ -925,6 +964,22 @@ class EndfieldOfficialClient:
                 )
                 if self._skland_foreground_waiters == 0:
                     self._skland_foreground_ready.set()
+
+    def _log_skland_exchange(
+        self, result: str, lock_wait: float, interval_wait: float, exchange: float
+    ) -> None:
+        """Count exchange time and log one line per exchange; never logs token-derived values."""
+        self._skland_metrics["exchange_ms"] += int(exchange * 1000)
+        log = (
+            logger.warning
+            if lock_wait + interval_wait > SKLAND_EXCHANGE_QUEUE_WARN_SECONDS
+            else logger.info
+        )
+        log(
+            f"[endfield-community] exchange result={result} lock_wait={lock_wait:.3f} "
+            f"interval_wait={interval_wait:.3f} exchange={exchange:.3f} "
+            f"foreground_waiters={self._skland_foreground_waiters}"
+        )
 
     async def _create_skland_context(
         self,

@@ -2048,8 +2048,13 @@ class EndfieldOfficialClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first, second)
         self.assertEqual(client._create_skland_context.await_count, 1)
         self.assertEqual(client._signed_skland_request.await_count, 2)
+        metrics = client.community_context_metrics()
         self.assertEqual(
-            client.community_context_metrics(),
+            {key: metrics[key] for key in (
+                "cache_hits", "singleflight_reuses", "exchange_attempts",
+                "exchange_succeeded", "exchange_failed", "circuit_rejections",
+                "lock_waits", "interval_waits",
+            )},
             {
                 "cache_hits": 1,
                 "singleflight_reuses": 0,
@@ -2057,8 +2062,12 @@ class EndfieldOfficialClientTests(unittest.IsolatedAsyncioTestCase):
                 "exchange_succeeded": 1,
                 "exchange_failed": 0,
                 "circuit_rejections": 0,
+                "lock_waits": 0,
+                "interval_waits": 0,
             },
         )
+        # Durations depend on the clock; they are counted, never negative.
+        self.assertTrue(all(isinstance(value, int) and value >= 0 for value in metrics.values()))
         await http.aclose()
 
     async def test_card_detail_refreshes_context_once_after_stale_signature(self):

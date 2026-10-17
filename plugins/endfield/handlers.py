@@ -3861,6 +3861,7 @@ async def _cache_status_lines() -> list[str]:
         _format_cache_stats("账号数据", detail_stats),
         _format_memory_pools(diagnostics),
         *_format_asset_queue(diagnostics.get("broker")),
+        _format_community_queue(official_client.community_context_metrics()),
         _format_browser_queue(browser_queue_snapshot()),
         f"缓存策略: 成品图 TTL {int(RENDER_CACHE_TTL_SECONDS)}s / 下载并发 8",
     ]
@@ -3872,6 +3873,20 @@ def _format_browser_queue(snapshot: dict) -> str:
     return (
         f"浏览器: 在途 {snapshot['inflight']} / 排队 交互 {waiting['interactive']} 后台 {waiting['background']} / "
         f"并发 {snapshot['concurrency']} / context {snapshot['contexts']}"
+    )
+
+
+def _format_community_queue(metrics: dict) -> str:
+    """Community credential exchanges and their queueing: counters and durations only."""
+    def seconds(key: str) -> str:
+        return f"{metrics.get(key, 0) / 1000:.1f}s"
+
+    return (
+        f"社区换签: 命中 {metrics.get('cache_hits', 0)} / 换签 {metrics.get('exchange_attempts', 0)}"
+        f"（失败 {metrics.get('exchange_failed', 0)}，熔断拒绝 {metrics.get('circuit_rejections', 0)}）/ "
+        f"等待锁 {metrics.get('lock_waits', 0)} 次 共 {seconds('lock_wait_ms')} / "
+        f"等待间隔 {metrics.get('interval_waits', 0)} 次 共 {seconds('interval_wait_ms')} / "
+        f"换签耗时 {seconds('exchange_ms')}"
     )
 
 

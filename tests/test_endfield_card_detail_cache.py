@@ -1,8 +1,9 @@
-"""card/detail 60 s 进程内复用：key、过期、并发合并、清理与隐私。"""
+"""card/detail 60 s 进程内复用、社区换签排队指标、签到 POST 与日历 GET 串行。"""
 
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 import unittest
 from types import SimpleNamespace
@@ -267,7 +268,7 @@ class CardDetailCleanupTests(_CacheTestCase):
             await handlers._close_ownership_startup_task()
         self.assertEqual((await handlers._CARD_DETAIL_CACHE.stats()).entries, 0)
 
-    async def test_status_shows_personal_data_without_identities(self):
+    async def test_status_shows_personal_data_and_community_queue_without_identities(self):
         await self.fill(ROLE_A)
         diagnostics = {
             "pools": {
@@ -276,9 +277,23 @@ class CardDetailCleanupTests(_CacheTestCase):
             },
             "namespaces": {},
         }
-        with patch.object(handlers, "get_http_cache_diagnostics", AsyncMock(return_value=diagnostics)):
+        metrics = {
+            "cache_hits": 7, "singleflight_reuses": 0, "exchange_attempts": 3,
+            "exchange_succeeded": 2, "exchange_failed": 1, "circuit_rejections": 0,
+            "lock_waits": 2, "lock_wait_ms": 2500, "interval_waits": 1,
+            "interval_wait_ms": 1900, "exchange_ms": 1236,
+        }
+        with (
+            patch.object(handlers, "get_http_cache_diagnostics", AsyncMock(return_value=diagnostics)),
+            patch.object(handlers.official_client, "community_context_metrics", return_value=metrics),
+        ):
             lines = await handlers._cache_status_lines()
         self.assertTrue(lines[6].startswith("账号数据: 1 项 / "), lines[6])
+        self.assertIn(
+            "社区换签: 命中 7 / 换签 3（失败 1，熔断拒绝 0）/ 等待锁 2 次 共 2.5s / "
+            "等待间隔 1 次 共 1.9s / 换签耗时 1.2s",
+            lines,
+        )
         self.assertTrue(lines[-2].startswith("浏览器: "))
         self.assertTrue(lines[-1].startswith("缓存策略"))
         fingerprint = account_credential_fingerprint("token")
@@ -313,10 +328,12 @@ class CardDetailPrivacyTests(_CacheTestCase):
         await http.aclose()
         client._create_skland_context.assert_awaited_once()  # a real exchange ran
         logged = _logged_text(handler_log, client_log)
+        self.assertIn("exchange result=ok", logged)
         fingerprint = account_credential_fingerprint(token)
         for secret in (raw, raw[:8], fingerprint, fingerprint[:8]):
             self.assertNotIn(secret, logged)
             self.assertFalse(any(secret in line for line in lines))
+        self.assertIn("社区换签: 命中 0 / 换签 1（失败 0，熔断拒绝 0）", "\n".join(lines))
 
 
 class DailyDashboardReuseTests(_CacheTestCase):
@@ -375,6 +392,143 @@ class DailyDashboardReuseTests(_CacheTestCase):
             await handlers._handle_daily(AsyncMock(), "caller", parse_command("日常"), Mock(), group=False)
         self.assertEqual(fetch.await_count, 1)
         self.prefetch.assert_called_once_with(_detail(), source="card_detail")
+
+
+class CommunityExchangeMetricsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_interval_and_lock_waits_are_counted_separately(self):
+        client, http = _client(community_exchange_interval_seconds=0.05)
+        client._create_skland_context = AsyncMock(side_effect=lambda token, *_args: _context(token))
+        with patch.object(client_module, "logger") as log:
+            await client._skland_context("first-token")
+            metrics = client.community_context_metrics()
+            self.assertEqual((metrics["lock_waits"], metrics["interval_waits"]), (0, 0))
+
+            await client._skland_context("second-token")  # right after: waits for the interval
+            metrics = client.community_context_metrics()
+            self.assertEqual((metrics["lock_waits"], metrics["interval_waits"]), (0, 1))
+            self.assertGreaterEqual(metrics["interval_wait_ms"], 40)
+            exchange_ms = metrics["exchange_ms"]
+
+            # Held longer than the interval, so only the lock is waited for.
+            await client._skland_exchange_lock.acquire()
+            third = asyncio.create_task(client._skland_context("third-token"))
+            await asyncio.sleep(0.08)
+            client._skland_exchange_lock.release()
+            await third
+            metrics = client.community_context_metrics()
+            self.assertEqual((metrics["lock_waits"], metrics["interval_waits"]), (1, 1))
+            self.assertGreaterEqual(metrics["lock_wait_ms"], 70)
+            self.assertGreaterEqual(metrics["exchange_ms"], exchange_ms)
+
+            # A context hit does not exchange or wait.
+            await client._skland_context("third-token")
+            self.assertEqual(client.community_context_metrics()["cache_hits"], 1)
+        await http.aclose()
+
+        lines = [call.args[0] for call in log.info.call_args_list]
+        self.assertEqual(len(lines), 3)
+        pattern = re.compile(
+            r"^\[endfield-community\] exchange result=ok lock_wait=\d+\.\d{3} "
+            r"interval_wait=\d+\.\d{3} exchange=\d+\.\d{3} foreground_waiters=\d+$"
+        )
+        self.assertTrue(all(pattern.match(line) for line in lines), lines)
+        self.assertRegex(lines[1], r"interval_wait=0\.0[2-9]\d")
+        self.assertRegex(lines[2], r"lock_wait=0\.(0[7-9]|[1-9])")
+        logged = _logged_text(log)
+        for token in ("first-token", "second-token", "third-token"):
+            self.assertNotIn(token, logged)
+            self.assertNotIn(account_credential_fingerprint(token)[:8], logged)
+        log.warning.assert_not_called()
+
+    async def test_background_waiting_for_foreground_counts_as_lock_wait(self):
+        client, http = _client(community_exchange_interval_seconds=0)
+        client._create_skland_context = AsyncMock(side_effect=lambda token, *_args: _context(token))
+        await client._skland_exchange_lock.acquire()
+        foreground = asyncio.create_task(client._skland_context("foreground-token"))
+        await asyncio.sleep(0)
+        background = asyncio.create_task(client._skland_context("background-token", background=True))
+        await asyncio.sleep(0.02)
+        client._skland_exchange_lock.release()
+        await asyncio.gather(foreground, background)
+        await http.aclose()
+        metrics = client.community_context_metrics()
+        self.assertEqual(metrics["lock_waits"], 2)
+        self.assertGreaterEqual(metrics["lock_wait_ms"], 30)
+
+    async def test_long_queue_and_failures_are_logged(self):
+        client, http = _client(community_exchange_interval_seconds=0.05)
+        client._create_skland_context = AsyncMock(
+            side_effect=[_context(), EndfieldAPIError("获取社区凭据", "10001", "busy")]
+        )
+        with (
+            patch.object(client_module, "SKLAND_EXCHANGE_QUEUE_WARN_SECONDS", 0.01),
+            patch.object(client_module, "logger") as log,
+        ):
+            await client._skland_context("first-token")
+            with self.assertRaises(EndfieldAPIError):
+                await client._skland_context("second-token")
+        await http.aclose()
+        self.assertIn("exchange result=ok", log.info.call_args.args[0])
+        self.assertIn("exchange result=failed", log.warning.call_args.args[0])
+        metrics = client.community_context_metrics()
+        self.assertEqual((metrics["exchange_failed"], metrics["interval_waits"]), (1, 1))
+
+
+class AttendanceSerialTests(unittest.IsolatedAsyncioTestCase):
+    async def test_calendar_get_starts_after_the_post_returns(self):
+        client, http = _client()
+        client._skland_context = AsyncMock(return_value=_context())
+        events: list[tuple[str, str, float]] = []
+
+        async def signed(_context, method, path, **_kwargs):
+            events.append((method, "start", time.perf_counter()))
+            if method == "POST":
+                await asyncio.sleep(0.05)
+                events.append((method, "done", time.perf_counter()))
+                return {"code": 0, "data": {"awardIds": [{"id": "a1"}]}}
+            return {
+                "code": 0,
+                "data": {
+                    "calendar": [{"done": True}, {"done": False}],
+                    "resourceInfoMap": {"a1": {"name": "折金票", "count": 1}},
+                },
+            }
+
+        client._signed_skland_request = AsyncMock(side_effect=signed)
+        role = SimpleNamespace(role_id="r1", server_id="1")
+        with patch.object(client_module, "logger") as log:
+            result = await client.attendance("secret-token-xyz", role)
+        await http.aclose()
+        self.assertEqual(
+            [call.args[1:3] for call in client._signed_skland_request.await_args_list],
+            [("POST", "/web/v1/game/endfield/attendance"), ("GET", "/web/v1/game/endfield/attendance")],
+        )
+        self.assertEqual([event[:2] for event in events], [("POST", "start"), ("POST", "done"), ("GET", "start")])
+        self.assertGreaterEqual(events[2][2], events[1][2])
+        self.assertEqual((result.status, result.monthly_count, result.calendar_days), ("success", 1, 2))
+        self.assertEqual([reward.name for reward in result.rewards], ["折金票"])  # name came from the GET
+        line = log.info.call_args.args[0]
+        self.assertRegex(
+            line,
+            r"^\[endfield-community\] attendance status=success post=0\.0[4-9]\d calendar=\d+\.\d{3} calendar_ok=true$",
+        )
+        self.assertNotIn("secret-token-xyz", _logged_text(log))
+
+    async def test_calendar_failure_is_logged_as_not_ok(self):
+        client, http = _client()
+        client._skland_context = AsyncMock(return_value=_context())
+        client._signed_skland_request = AsyncMock(
+            side_effect=[
+                EndfieldAPIError("社区请求", "10001", "已签到"),
+                EndfieldAPIError("社区请求", "500", "busy"),
+            ]
+        )
+        with patch.object(client_module, "logger") as log:
+            result = await client.attendance("token", SimpleNamespace(role_id="r1", server_id="1"))
+        await http.aclose()
+        self.assertEqual((result.status, result.monthly_count), ("already", None))
+        self.assertIn("status=already", log.info.call_args.args[0])
+        self.assertIn("calendar_ok=false", log.info.call_args.args[0])
 
 
 if __name__ == "__main__":
