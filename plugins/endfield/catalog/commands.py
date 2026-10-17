@@ -313,6 +313,8 @@ def parse_command(rest: str) -> ParsedEndfieldCommand:
         return ParsedEndfieldCommand("source")
     if head in CALENDAR_ALIASES:
         return ParsedEndfieldCommand("calendar")
+    if head in {"公告", "活动提醒", "announcements"}:
+        return ParsedEndfieldCommand("announcements", args=tuple(parts[1:]))
     if head in DEV_ALIASES:
         dev_action = parts[1].lower() if len(parts) > 1 else "help"
         return ParsedEndfieldCommand("dev", dev_action=dev_action, args=tuple(parts[2:]))
@@ -997,6 +999,7 @@ def format_help() -> str:
             "  /ef 持有率 刷新 [群内|全局] —— 手动更新持有率快照（管理员可刷新本群，机器人管理员可刷新全局）",
             "  /ef 速算 2腐蚀 200 —— 计算异常效果与技艺强度的伤害数值（支持腐蚀、导电、碎甲）",
             "  /ef 版本日历 —— 查看当前版本各项活动与关卡开放日程表",
+            "  /ef 公告 帮助 —— 订阅国服活动公告，多活动合并成一张图并提前提醒（开始/结束/维护）",
             "",
             "  /ef <关键词>",
             "  /ef 干员 <名称> | /ef op <名称>",

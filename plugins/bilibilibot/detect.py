@@ -16,6 +16,7 @@ import re
 from collections.abc import Iterable
 from dataclasses import replace
 
+from .lottery_filter import suppress_dynamic
 from .models import (
     BiliCard,
     BiliEvent,
@@ -193,6 +194,10 @@ def detect_dynamic(
         newest_ts = max(newest_ts, card.published_at)
         newest_id = item_id
         seen = SeenItem(KIND_DYNAMIC, prev.uid, item_id, card.published_at)
+        # 抽奖动态照常标记已读并推进游标，既不推送也不会被反复重投。
+        if suppress_dynamic(card, uid=prev.uid):
+            marked.append(seen)
+            continue
         if video_subscribed and bvid_from_card(card):
             marked.append(seen)
             continue

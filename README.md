@@ -8,8 +8,16 @@
 End 插件的公共资料默认优先 AKEData；账号接口仍用官方，缺失资料保留兼容回退。
 覆盖范围、缓存变化与实测见 [AKE 迁移记录](docs/endfield_ake_migration_execution.md)。
 
+终末地国服活动公告提醒：`/ef 公告 订阅`，支持群聊与私聊、类型筛选、到点开始推送及开始/结束/维护提前提醒。
+同一轮提醒合并为一张图片，展示活动配图、摘要、起止时间和倒计时；订阅和发送队列重启后保留。
+用法和时间解析范围见 [活动公告提醒](docs/endfield_announcements.md)。
+
 已绑定账号可用 `/ef 探索` 或 `/zmd 探索` 查看全部地区的六类收集进度，默认查询主账号。
 命令用法、图片预览与数据边界见 [地区探索查询](docs/endfield_exploration.md)。
+
+B 站动态订阅默认跳过社交抽奖，只推送游戏资讯；可用 BILI_LOTTERY_FILTER_UIDS
+收窄到指定账号或关闭。判定依据与已知限制见
+[动态抽奖的过滤规则](docs/bilibili_endfield_lottery_filter.md)。
 
 HYW 搜索问答插件已接入：`/q 问题`、图片解释和引用追问。
 配置模型后使用，详见 [HYW 配置与用法](docs/hyw_plugin.md)。

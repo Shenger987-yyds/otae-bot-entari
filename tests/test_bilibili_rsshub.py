@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import gc
 
+import pytest
+
 from plugins.bilibilibot.api import rsshub
 from plugins.bilibilibot.api.session import BiliAPIError
 
@@ -95,3 +97,45 @@ def test_no_instances_is_reported_without_starting_tasks():
     outcome, unretrieved = _race({})
     assert isinstance(outcome, BiliAPIError)
     assert unretrieved == []
+
+
+# --- 一页多条 ---------------------------------------------------------------
+
+_RSS_PAGE = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"><channel><title>终末地 的 B站动态</title>
+<item><title>第一条</title><link>https://t.bilibili.com/1</link>
+<description>&lt;img src="https://i0.hdslb.com/1.jpg"/&gt;正文一</description>
+<pubDate>Tue, 14 Oct 2025 08:00:00 GMT</pubDate></item>
+<item><title>第二条</title><link>https://t.bilibili.com/2</link>
+<description>正文二</description>
+<pubDate>Tue, 14 Oct 2025 09:00:00 GMT</pubDate></item>
+<item><title>第三条</title><link>https://t.bilibili.com/3</link>
+<description>正文三</description>
+<pubDate>Tue, 14 Oct 2025 10:00:00 GMT</pubDate></item>
+</channel></rss>"""
+
+
+def test_parse_items_reads_a_bounded_page():
+    items = rsshub.parse_items(_RSS_PAGE, limit=2)
+    assert [item["link"] for item in items] == [
+        "https://t.bilibili.com/1",
+        "https://t.bilibili.com/2",
+    ]
+    assert items[0]["cover_url"] == "https://i0.hdslb.com/1.jpg"
+    assert items[0]["author"] == "终末地"
+    assert items[1]["cover_url"] == ""
+
+
+def test_parse_items_rejects_an_empty_feed():
+    with pytest.raises(BiliAPIError, match="contains no item"):
+        rsshub.parse_items("<rss><channel></channel></rss>")
+
+
+def test_parse_items_handles_atom_entries():
+    page = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"><title>终末地 的 B站动态</title>
+<entry><title>甲</title><link href="https://t.bilibili.com/9"/><summary>正文甲</summary>
+<updated>2025-10-14T08:00:00Z</updated></entry></feed>"""
+    items = rsshub.parse_items(page)
+    assert items[0]["link"] == "https://t.bilibili.com/9"
+    assert items[0]["description"] == "正文甲"

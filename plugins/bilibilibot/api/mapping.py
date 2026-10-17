@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from ..lottery_filter import applies_to, lottery_reason
 from ..models import BiliCard, KIND_DYNAMIC, KIND_VIDEO
 
 
@@ -28,6 +29,28 @@ def bvid_from_card(card: BiliCard) -> str:
     return ""
 
 
+def _opus_text(major: dict[str, Any]) -> str:
+    """Opus 的正文不在 desc 里，只在 major.opus.summary。"""
+    summary = (major.get("opus") or {}).get("summary") or {}
+    text = str(summary.get("text") or "")
+    if text:
+        return text
+    return "".join(
+        str(node.get("text") or node.get("orig_text") or "")
+        for node in summary.get("rich_text_nodes") or []
+    )
+
+
+def _forward_text(item: dict[str, Any]) -> str:
+    orig = item.get("orig") or {}
+    if not isinstance(orig, dict):
+        return ""
+    dynamic = (orig.get("modules") or {}).get("module_dynamic") or {}
+    major = dynamic.get("major") or {}
+    text = _opus_text(major) if major.get("type") == "MAJOR_TYPE_OPUS" else ""
+    return text or str((dynamic.get("desc") or {}).get("text") or "")
+
+
 def dynamic_item_to_card(item: dict[str, Any], uid: str) -> BiliCard:
     """Map one dynamic feed entry to a card (public form of the old private helper)."""
     modules = item.get("modules") or {}
@@ -35,12 +58,18 @@ def dynamic_item_to_card(item: dict[str, Any], uid: str) -> BiliCard:
     dynamic = modules.get("module_dynamic") or {}
     desc = dynamic.get("desc") or {}
     major = dynamic.get("major") or {}
+    opus = major.get("opus") or {}
     additional = dynamic.get("additional") or {}
     title = "发布了新动态"
     cover = ""
     url = f"https://t.bilibili.com/{item.get('id_str')}"
 
-    if major.get("type") == "MAJOR_TYPE_DRAW":
+    if major.get("type") == "MAJOR_TYPE_OPUS":
+        title = str(opus.get("title") or title)
+        images = opus.get("pics") or []
+        cover = str(images[0].get("url") or "") if images else ""
+        url = str(opus.get("jump_url") or url)
+    elif major.get("type") == "MAJOR_TYPE_DRAW":
         images = (major.get("draw") or {}).get("items") or []
         cover = str(images[0].get("src") or "") if images else ""
     elif major.get("type") == "MAJOR_TYPE_ARTICLE":
@@ -60,9 +89,24 @@ def dynamic_item_to_card(item: dict[str, Any], uid: str) -> BiliCard:
         cover = str(ugc.get("cover") or "")
         url = str(ugc.get("jump_url") or url)
 
-    text = str(desc.get("text") or "")
+    # 官号改版后正文放在 Opus 摘要里，desc 常为 null；富文本节点是最后的兜底。
+    summary = opus.get("summary") or {}
+    text = str(desc.get("text") or summary.get("text") or "")
+    if not text:
+        text = "".join(
+            str(node.get("text") or node.get("orig_text") or "")
+            for node in (
+                desc.get("rich_text_nodes") or summary.get("rich_text_nodes") or []
+            )
+        )
+    if item.get("type") == "DYNAMIC_TYPE_FORWARD":
+        forwarded = _forward_text(item)
+        if forwarded:
+            text = f"{text}\n\n// 转发：{forwarded}" if text else f"// 转发：{forwarded}"
     if text and title == "发布了新动态":
         title = text.splitlines()[0][:40] or title
+    if url.startswith("//"):
+        url = "https:" + url
     return BiliCard(
         KIND_DYNAMIC,
         title=title,
@@ -75,6 +119,7 @@ def dynamic_item_to_card(item: dict[str, Any], uid: str) -> BiliCard:
         uid=uid,
         item_id=bvid_from_url(url) or str(item.get("id_str") or ""),
         published_at=int(author.get("pub_ts") or 0),
+        lottery_reason=lottery_reason(item) if applies_to(uid) else "",
     )
 
 

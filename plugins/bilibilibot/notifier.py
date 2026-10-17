@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
+from .lottery_filter import suppress_dynamic
 from .models import BiliCard
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -348,6 +349,11 @@ class Notifier:
     async def _handle_row(self, row: Any) -> None:
         recipient = f"{row.subscriber_type}:{row.subscriber_id}"
         try:
+            # 过滤器装上之前入队的抽奖动态也要在这里丢掉，不再渲染或发送。
+            card = _card_from_row(row)
+            if suppress_dynamic(card, uid=getattr(row, "uid", "") or card.uid):
+                await _resolve(self.store.outbox_done(row.id))
+                return
             png = await self._render(row)
             await self.send(row, png)
         except asyncio.CancelledError:
