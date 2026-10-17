@@ -368,27 +368,26 @@ class PublicImageDiskCache:
             return index
         if not self.path.exists():
             return None
-        with self._read_lock:
-            # Hold the write lock so no commit lands between the scan and publishing it.
-            with self._lock:
-                if self._index is None:
-                    rows = (
-                        self._read_connection()
-                        .execute(
-                            "SELECT key, namespace, validated_at, max_age, etag, modified, "
-                            "digest FROM public_images_v1"
-                        )
-                        .fetchall()
+        # Hold the write lock too, so no commit lands between the scan and publishing it.
+        with self._read_lock, self._lock:
+            if self._index is None:
+                rows = (
+                    self._read_connection()
+                    .execute(
+                        "SELECT key, namespace, validated_at, max_age, etag, modified, "
+                        "digest FROM public_images_v1"
                     )
-                    loaded = {
-                        key: _IndexRow(
-                            namespace, DiskImageMeta(validated_at, max_age, etag, modified), digest
-                        )
-                        for key, namespace, validated_at, max_age, etag, modified, digest in rows
-                    }
-                    with self._index_lock:
-                        self._index = loaded
-                return self._index
+                    .fetchall()
+                )
+                loaded = {
+                    key: _IndexRow(
+                        namespace, DiskImageMeta(validated_at, max_age, etag, modified), digest
+                    )
+                    for key, namespace, validated_at, max_age, etag, modified, digest in rows
+                }
+                with self._index_lock:
+                    self._index = loaded
+            return self._index
 
     def _index_apply(self, changes: dict[str, _IndexRow | None]) -> None:
         """Publish committed row changes (None = row deleted). Caller holds ``_lock``."""

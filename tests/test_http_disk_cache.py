@@ -519,9 +519,12 @@ class MetadataIndexTests(_Case):
         self.assertEqual(single.digest, real_sha256(bodies["k0001"]).hexdigest())
         selects = [sql for sql in statements if " IN (" in sql]
         self.assertEqual(len(selects), 2 + 2 + 1)  # 450 keys -> two batches per call, then get()
-        with mock.patch.object(disk_module.time, "time", return_value=time.time() + disk_module.VERIFY_INTERVAL_SECONDS + 1):
-            with mock.patch.object(disk_module.hashlib, "sha256", counting_sha256):
-                cache.get("k0001", 1000)
+        later = time.time() + disk_module.VERIFY_INTERVAL_SECONDS + 1
+        with (
+            mock.patch.object(disk_module.time, "time", return_value=later),
+            mock.patch.object(disk_module.hashlib, "sha256", counting_sha256),
+        ):
+            cache.get("k0001", 1000)
         self.assertEqual(len(hashed), 1)  # the marker expires
 
     def test_rows_written_by_another_process_appear_after_a_reload(self):

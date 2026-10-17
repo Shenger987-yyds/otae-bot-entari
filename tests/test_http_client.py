@@ -14,7 +14,10 @@ import httpx
 from otae_bot.infrastructure.cache import AsyncTTLCache
 from otae_bot.infrastructure.http import client as http_client
 from otae_bot.infrastructure.http import tls
-from otae_bot.infrastructure.http.asset_policy import AssetFetchSettings, configure_asset_settings
+from otae_bot.infrastructure.http.asset_policy import (
+    AssetFetchSettings,
+    configure_asset_settings,
+)
 from otae_bot.infrastructure.http.disk import PublicImageDiskCache
 
 

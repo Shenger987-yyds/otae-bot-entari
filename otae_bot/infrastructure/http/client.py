@@ -64,7 +64,7 @@ I18N_CACHE_MAX_BYTES = _cache_budget("OTAE_HTTP_I18N_CACHE_MIB", 64)
 ASSET_CACHE_MAX_BYTES = _cache_budget("OTAE_HTTP_ASSET_CACHE_MIB", 64)
 # 超过这个体积的图（立绘、横幅）只要磁盘上有副本就不进内存池，命中时直接读磁盘。
 ASSET_LARGE_ENTRY_BYTES = (
-    max(1, int(os.environ.get("OTAE_HTTP_ASSET_LARGE_ENTRY_KIB", 1024))) * 1024
+    max(1, int(os.environ.get("OTAE_HTTP_ASSET_LARGE_ENTRY_KIB", "1024"))) * 1024
 )
 HTTP_CACHE_MAX_BYTES = (
     API_CACHE_MAX_BYTES

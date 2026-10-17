@@ -1,6 +1,6 @@
 """Reusable browser process, resource loading and HTML screenshots."""
 
-from typing import Any, Callable, Iterator, Literal, TypeVar
+from typing import Any, Literal, TypeVar
 from otae_bot.config.paths import TEMP_PATH
 from otae_bot.config.settings import SYSTEM_PROXY
 import base64
@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 
 from loguru import logger
 
