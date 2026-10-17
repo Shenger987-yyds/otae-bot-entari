@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from otae_bot.infrastructure.http.client import HttpResource
@@ -93,6 +96,60 @@ class DetailAssetUrlTests(unittest.TestCase):
             aliases = shared_image_namespaces(namespace)
             self.assertEqual(len(aliases), 2)
             self.assertNotIn(namespace, aliases)
+
+
+class CardDetailSnapshotTests(unittest.IsolatedAsyncioTestCase):
+    async def test_snapshot_is_written_in_the_background_and_assets_are_prefetched(self):
+        role = SimpleNamespace(role_id="r1", server_id="1")
+        detail = _detail()
+        written = asyncio.Event()
+
+        async def slow_persist(_role, _detail):
+            await asyncio.sleep(0.3)
+            written.set()
+
+        with (
+            patch.object(handlers.official_client, "card_detail", AsyncMock(return_value=detail)),
+            patch.object(handlers.ownership_stats_service, "persist_detail", side_effect=slow_persist),
+            patch.object(handlers, "prefetch_detail_assets") as prefetch_assets,
+        ):
+            started = time.monotonic()
+            result = await handlers._card_detail_with_snapshot("token", role)
+            self.assertLess(time.monotonic() - started, 0.1)
+            self.assertIs(result, detail)
+            prefetch_assets.assert_called_once_with(detail, source="card_detail")
+            self.assertFalse(written.is_set())
+            await asyncio.wait_for(written.wait(), 2)
+
+    async def test_failed_snapshot_write_is_swallowed_and_cleanup_cancels_pending_writes(self):
+        role = SimpleNamespace(role_id="r2", server_id="1")
+        blocked = asyncio.Event()
+
+        async def never(_role, _detail):
+            await blocked.wait()
+
+        with (
+            patch.object(handlers.official_client, "card_detail", AsyncMock(return_value={})),
+            patch.object(handlers.ownership_stats_service, "persist_detail", AsyncMock(side_effect=RuntimeError)),
+            patch.object(handlers, "prefetch_detail_assets"),
+        ):
+            await handlers._card_detail_with_snapshot("token", role)
+            await asyncio.sleep(0.01)  # the failing write ran and was swallowed
+        with (
+            patch.object(handlers.official_client, "card_detail", AsyncMock(return_value={})),
+            patch.object(handlers.ownership_stats_service, "persist_detail", side_effect=never),
+            patch.object(handlers, "prefetch_detail_assets"),
+        ):
+            await handlers._card_detail_with_snapshot("token", role)
+        pending = list(handlers._background_tasks)
+        self.assertEqual(len(pending), 1)
+        with (
+            patch.object(handlers, "close_challenge_locale", AsyncMock()),
+            patch.object(handlers.official_client, "close", AsyncMock()),
+        ):
+            await handlers._close_ownership_startup_task()
+        self.assertTrue(pending[0].cancelled())
+        self.assertEqual(handlers._background_tasks, set())
 
 
 class BrokerWiringTests(unittest.IsolatedAsyncioTestCase):

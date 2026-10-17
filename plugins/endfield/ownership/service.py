@@ -473,6 +473,13 @@ class OwnershipStatsService:
         *,
         fetched_at: int | None = None,
     ) -> int:
+        # Parsing and the SQLite write run off the event loop; the store serializes
+        # access with its own lock.
+        return await asyncio.to_thread(self._persist_detail, role, detail, fetched_at)
+
+    def _persist_detail(
+        self, role: EndfieldRole, detail: Mapping[str, Any], fetched_at: int | None
+    ) -> int:
         members, game_saved_at = parse_operator_snapshot(detail, self.store.list_operator_catalog())
         return self.store.replace_operator_snapshot(
             role,

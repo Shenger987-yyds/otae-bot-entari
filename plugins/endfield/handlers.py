@@ -1683,17 +1683,32 @@ async def _handle_accounts(
     return await _render_account_detail(matcher, role, cipher, group=group)
 
 
-async def _card_detail_with_snapshot(token: str, role: EndfieldRole) -> dict:
-    async with ROLE_TASKS.claim(role):
-        detail = await official_client.card_detail(token, role)
-    # 素材 URL 此刻已知：先在后台把图预取到磁盘，与名称表加载、视图构建重叠。
-    prefetch_detail_assets(detail, source="card_detail")
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background(coroutine) -> None:
+    """Run work the reply does not wait for; cancelled on Cleanup."""
+    task = asyncio.create_task(coroutine)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def _persist_detail_quietly(role: EndfieldRole, detail: dict) -> None:
     try:
         await ownership_stats_service.persist_detail(role, detail)
     except Exception:
         # Opportunistic writes must not affect the account-detail response;
         # refresh batches report aggregate failures without logging identities.
         pass
+
+
+async def _card_detail_with_snapshot(token: str, role: EndfieldRole) -> dict:
+    async with ROLE_TASKS.claim(role):
+        detail = await official_client.card_detail(token, role)
+    # 持有率快照在后台写，不挡视图构建；素材 URL 此刻已知，先在后台把图预取到磁盘，
+    # 与名称表加载、视图构建重叠。
+    _spawn_background(_persist_detail_quietly(role, detail))
+    prefetch_detail_assets(detail, source="card_detail")
     return detail
 
 
@@ -2237,8 +2252,8 @@ async def _handle_daily(
     roles = account_store.resolve_roles(qq_user_id, command.account_selector)
     if not roles:
         return await matcher.finish("未找到对应的终末地账号，请先私聊发送 /ef 绑定 进行添加。")
-    accounts: list[DailyAccountView] = []
-    for role in roles:
+
+    async def load(role: EndfieldRole) -> DailyAccountView:
         try:
             async with ROLE_TASKS.claim(role):
                 token = account_store.decrypt_token(role, cipher)
@@ -2246,26 +2261,29 @@ async def _handle_daily(
                 # 仅供奖章/档案等自行解包的视图使用。
                 detail = await official_client.card_detail(token, role)
             prefetch_detail_assets(detail, source="daily")
-            accounts.append(build_daily_account_view(
+            return build_daily_account_view(
                 detail,
                 nickname=role.nickname, uid=role.masked_uid,
                 server_name=server_label(role.server_name or role.server_id),
-            ))
+            )
         except TaskAlreadyRunning:
-            accounts.append(DailyAccountView(
-                role.nickname, role.masked_uid, role.server_name, status="failed", message="当前任务正在处理中"))
+            return DailyAccountView(
+                role.nickname, role.masked_uid, role.server_name, status="failed", message="当前任务正在处理中")
         except EndfieldAPIError as exc:
-            accounts.append(DailyAccountView(
-                role.nickname, role.masked_uid, role.server_name, status="failed", message=str(exc)))
+            return DailyAccountView(
+                role.nickname, role.masked_uid, role.server_name, status="failed", message=str(exc))
         except CredentialKeyError as exc:
-            accounts.append(DailyAccountView(
-                role.nickname, role.masked_uid, role.server_name, status="failed", message=str(exc)))
+            return DailyAccountView(
+                role.nickname, role.masked_uid, role.server_name, status="failed", message=str(exc))
         except Exception as exc:
             logger.error(
                 f"[endfield-account] daily dashboard failed: stored_role={role.id} error_type={type(exc).__name__}"
             )
-            accounts.append(DailyAccountView(
-                role.nickname, role.masked_uid, role.server_name, status="failed", message="数据获取失败，请稍后再试"))
+            return DailyAccountView(
+                role.nickname, role.masked_uid, role.server_name, status="failed", message="数据获取失败，请稍后再试")
+
+    # 各账号并行取（每个角色仍各自 claim）；gather 保持绑定顺序。
+    accounts = list(await asyncio.gather(*(load(role) for role in roles)))
     png = await draw_daily_dashboard_card(
         DailyDashboardView(accounts, format_timestamp(int(__import__("time").time())))
     )
@@ -4005,7 +4023,7 @@ timer.add_job(
 @listen(Cleanup)
 async def _close_ownership_startup_task() -> None:
     startup_tasks = [
-        task for task in (_ownership_startup_task, _asset_hotset_task)
+        task for task in (_ownership_startup_task, _asset_hotset_task, *_background_tasks)
         if task is not None and not task.done()
     ]
     for task in startup_tasks:

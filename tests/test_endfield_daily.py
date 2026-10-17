@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import importlib.util
 import sys
+import time
 import types
 import unittest
 from pathlib import Path
@@ -177,6 +179,52 @@ class DailyAccountViewTests(unittest.TestCase):
         self.assertIsNone(view.weekly_current)
         self.assertIsNone(view.bp_level)
         self.assertEqual(view.status, "ok")
+
+
+class DailyParallelFetchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_accounts_load_in_parallel_in_binding_order_and_fail_independently(self):
+        from unittest.mock import AsyncMock, Mock, patch
+
+        from plugins.endfield import handlers
+        from plugins.endfield.account.client import EndfieldAPIError
+
+        roles = [
+            types.SimpleNamespace(
+                id=index, role_id=f"role-{index}", server_id="1", nickname=f"账号{index}",
+                masked_uid=f"****000{index}", server_name="China",
+            )
+            for index in range(3)
+        ]
+        store = Mock()
+        store.resolve_roles.return_value = roles
+        store.decrypt_token.side_effect = lambda role, _cipher: f"token-{role.id}"
+
+        async def card_detail(token, role):
+            await asyncio.sleep(0.3)
+            if role.id == 1:
+                raise EndfieldAPIError("card_detail", "10000", "接口繁忙")
+            return {"base": {"name": f"管理员{role.id}"}}
+
+        draw = AsyncMock(return_value=b"png")
+        with (
+            patch.object(handlers, "account_store", store),
+            patch.object(handlers.official_client, "card_detail", side_effect=card_detail),
+            patch.object(handlers, "draw_daily_dashboard_card", draw),
+            patch.object(handlers, "_finish_png", AsyncMock()),
+            patch.object(handlers, "prefetch_detail_assets") as prefetch,
+        ):
+            started = time.monotonic()
+            await handlers._handle_daily(
+                AsyncMock(), "caller", commands_module.parse_command("日常"), Mock(), group=False
+            )
+            elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 0.6)
+        accounts = draw.await_args.args[0].accounts
+        self.assertEqual([account.uid for account in accounts], ["****0000", "****0001", "****0002"])
+        self.assertEqual([account.status for account in accounts], ["ok", "failed", "ok"])
+        self.assertIn("接口繁忙", accounts[1].message)
+        self.assertEqual(prefetch.call_count, 2)
+        self.assertEqual({call.kwargs["source"] for call in prefetch.call_args_list}, {"daily"})
 
 
 if __name__ == "__main__":
