@@ -522,7 +522,7 @@ body{padding:0;
 .section-head h2{margin:0;font-size:24px;line-height:1;font-weight:950;letter-spacing:.01em}
 .section-meta{margin-left:auto;font-size:12px;font-weight:850;letter-spacing:.1em;color:#727b81}
 .section-body{padding-top:14px}
-p{margin:0;font-size:15.5px;line-height:1.7;font-weight:700;color:#232a30;overflow-wrap:anywhere}
+p{margin:0;max-width:620px;font-size:15.5px;line-height:1.7;font-weight:700;color:#232a30;overflow-wrap:anywhere}
 p+p{margin-top:8px}
 p.deco{margin-top:12px;padding:11px 14px;border-left:3px solid #d3d7d1;background:#f5f6f1;
   font-size:15px;color:#4a545b}
@@ -619,7 +619,7 @@ def _css() -> str:
 def _document(klass: str, accent: str, hero: str, body: str, revision: str) -> str:
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><style>{_css()}</style></head>
 <body><main class="ency-card {klass}" style="--accent:{_attr(accent)}"><div class="sheet">{hero}{body}
-<footer><span>ENDFIELD · CODEX · 数据来源 AkeData</span><span class="mono">{_escape(revision)}</span></footer>
+<footer><span>ENDFIELD · CODEX · 数据来源 AkeData</span><span class="mono">{_escape(str(revision).split("|", 1)[0])}</span></footer>
 </div></main></body></html>"""
 
 

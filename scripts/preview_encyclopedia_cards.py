@@ -142,16 +142,69 @@ def _html_name(kind: str) -> str:
     return "archive_entry" if kind == "archive" else kind
 
 
+def _text_of(value, texts: dict) -> str:
+    if not isinstance(value, dict):
+        return str(value or "")
+    return str(texts.get(str(value.get("id"))) or value.get("text") or "")
+
+
+async def _run_live(args, out_dir: Path) -> None:
+    """用线上真实快照渲染，验证实际数据下的版式。"""
+    snapshot = await repository.snapshot()
+    print(f"live snapshot {snapshot.revision}")
+
+    keys = [part.strip() for part in args.keys.split(",") if part.strip()]
+    if not keys:
+        table = await snapshot.table("ItemTable")
+        texts = await snapshot.table("I18nTextTable_CN")
+        rows = [
+            (int(entry.get("rarity") or 0), key)
+            for key, entry in table.items()
+            if _text_of(entry.get("name"), texts)
+            and entry.get("iconId")
+            and _text_of(entry.get("desc"), texts)
+        ]
+        rows.sort(key=lambda item: (-item[0], item[1]))
+        keys = [key for _, key in rows[:6]]
+
+    for key in keys:
+        try:
+            view = await ency_items.build_item_view(snapshot, key)
+        except Exception as exc:  # noqa: BLE001 - 预览脚本只报告，不中断
+            print(f"skip {key} {type(exc).__name__} {exc}")
+            continue
+        png = await ency_draw.draw_item_card(view)
+        path = out_dir / f"live-item-{key}.png"
+        path.write_bytes(png)
+        print(f"{path.relative_to(ROOT)}  {view.name}  {len(png)} bytes")
+
+    overview = await ency_service.catalog_view(snapshot, "item", "")
+    for index, page in enumerate(await ency_draw.draw_catalog_cards(overview), start=1):
+        path = out_dir / f"live-catalog-item-{index:02d}.png"
+        path.write_bytes(page)
+        print(f"{path.relative_to(ROOT)}  catalog  {len(page)} bytes")
+
+    from otae_bot.infrastructure.rendering.browser import close_browser
+
+    await close_browser()
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--only", default="", help="逗号分隔的 kind：item,prop,enemy,term,archive,catalog")
     parser.add_argument("--out", default=str(OUT_DIR))
     parser.add_argument("--html", action="store_true", help="同时落盘渲染 HTML")
+    parser.add_argument("--live", action="store_true", help="改用线上真实快照渲染，不发夹具")
+    parser.add_argument("--keys", default="", help="live 模式下逗号分隔的物品 id，留空则自动挑 6 个")
     args = parser.parse_args()
 
     wanted = {part.strip() for part in args.only.split(",") if part.strip()}
     out_dir = Path(args.out).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.live:
+        await _run_live(args, out_dir)
+        return
 
     snapshot = _snapshot()
     with patch.object(repository, "_get", side_effect=AssertionError("预览不应请求数据表")):
