@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from .health import record_asset_seconds, record_assets, record_fallback_success
+from .health import (
+    record_asset_seconds,
+    record_assets,
+    record_batch_stats,
+    record_fallback_success,
+)
 
 import asyncio
 import base64
@@ -3616,8 +3621,8 @@ async def _prepare_assets(urls: Iterable[str], *, inline: bool) -> _PreparedAsse
     # 图床（hycdn / assets.fz.wiki）的 404 与超时都是间歇的，交给共享的
     # fetch_many_resilient 退避重试；成功的走缓存命中，避免单次抖动导致渲染「无图」。
     # 超时、重试次数、按主机熔断与整批预算都取素材通道的配置（OTAE_HTTP_ASSET_*），
-    # 到点没取到的按缺失处理，沿用各卡片原有的占位 / 留空逻辑。
-    # 缺图原因由它自己写日志，这里不再重复一遍。
+    # 到点没取到的按缺失处理，沿用各卡片原有的占位 / 留空逻辑；没下完的在后台续传，
+    # 下次查询就是热的。缺图原因由它自己写日志，这里不再重复一遍。
     fetched = await fetch_many_resilient(
         remote_urls,
         namespace=REMOTE_ASSET_NAMESPACE,
@@ -3632,6 +3637,7 @@ async def _prepare_assets(urls: Iterable[str], *, inline: bool) -> _PreparedAsse
         resources, failures = fetched
     else:
         resources, failures = fetched, {}
+    record_batch_stats(getattr(fetched, "stats", None))
     output = dict(direct)
     browser_resources: dict[str, BrowserResource] = {}
     contents: dict[str, bytes] = {}

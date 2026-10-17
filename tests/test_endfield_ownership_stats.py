@@ -929,6 +929,18 @@ class OwnershipRefreshAndGroupTests(unittest.TestCase):
             {101, 102},
         )
 
+    def test_refresh_prefetches_the_fetched_detail_assets(self):
+        self.store.bind_roles(
+            "qq", "token", [RoleCandidate("binding", "role", "1", "role")], self.cipher
+        )
+        service = OwnershipStatsService(self.store, _RosterClient(), concurrency=1)
+        with (
+            mock.patch.object(service, "refresh_catalog", mock.AsyncMock(return_value=False)),
+            mock.patch("plugins.endfield.ownership.service.prefetch_detail_assets") as prefetch,
+        ):
+            asyncio.run(service.refresh_roles(self.store.list_all_roles(), self.cipher, force=True))
+        prefetch.assert_called_once_with(_roster(1), source="ownership")
+
     def test_refresh_result_reports_anonymous_batch_and_community_metrics(self):
         self.store.bind_roles(
             "qq",

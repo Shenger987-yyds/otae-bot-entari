@@ -52,6 +52,7 @@ from otae_bot.adapters.message_log import sensitive_input
 from otae_bot.adapters.onebot import send_forward_images
 from otae_bot.infrastructure.rendering.help_runtime import cached_help_image
 from otae_bot.infrastructure.http.asset_policy import asset_render_budget
+from otae_bot.infrastructure.http.assets import broker as asset_broker
 from otae_bot.infrastructure.http.client import (
     clear_http_cache,
     get_http_cache_diagnostics,
@@ -63,6 +64,7 @@ from .providers.warfarin import WarfarinAPIError, WarfarinClient
 from .rendering.health import track_render_health
 from .account.detail.names import clear_account_detail_name_map
 from .account.investment.service import clear_account_investment_catalog
+from .account.prefetch import prefetch_detail_assets
 from .account.challenge.i18n import clear_challenge_locale, close_challenge_locale, fetch_challenge_locale
 from .account.client import (
     ACCOUNT_PROVIDER_CN,
@@ -1684,6 +1686,8 @@ async def _handle_accounts(
 async def _card_detail_with_snapshot(token: str, role: EndfieldRole) -> dict:
     async with ROLE_TASKS.claim(role):
         detail = await official_client.card_detail(token, role)
+    # 素材 URL 此刻已知：先在后台把图预取到磁盘，与名称表加载、视图构建重叠。
+    prefetch_detail_assets(detail, source="card_detail")
     try:
         await ownership_stats_service.persist_detail(role, detail)
     except Exception:
@@ -2104,15 +2108,17 @@ async def _render_account_pages(
     )
 
     asset_seconds = 0.0
+    network = (0, 0, 0)
 
     async def create_pages():
-        nonlocal asset_seconds
+        nonlocal asset_seconds, network
         # 整张卡共用一个素材预算；到点未取到的素材留空，页面照常出图（不进缓存）。
         with track_render_health() as health, asset_render_budget():
             try:
                 pages = tuple(await render())
             finally:
                 asset_seconds = health.asset_seconds
+                network = (health.network, health.revalidated, health.refill)
             if not health.complete:
                 raise _IncompletePages(pages)
             return pages
@@ -2128,7 +2134,8 @@ async def _render_account_pages(
     logger.info(
         f"[endfield] account-render kind={kind} reuse={hit} data={data_seconds:.3f} "
         f"assets={asset_seconds:.3f} draw={max(0.0, seconds - asset_seconds):.3f} "
-        f"seconds={seconds:.3f} pages={len(pages)}"
+        f"seconds={seconds:.3f} pages={len(pages)} "
+        f"net={network[0]} net_304={network[1]} refill={network[2]}"
     )
     return pages
 
@@ -2238,6 +2245,7 @@ async def _handle_daily(
                 # card_detail 返回已解包的 data.detail；endfield_card_detail 是完整响应，
                 # 仅供奖章/档案等自行解包的视图使用。
                 detail = await official_client.card_detail(token, role)
+            prefetch_detail_assets(detail, source="daily")
             accounts.append(build_daily_account_view(
                 detail,
                 nickname=role.nickname, uid=role.masked_uid,
@@ -3738,6 +3746,7 @@ async def _clear_endfield_caches(scope: str) -> int:
         removed += clear_account_detail_name_map()
         removed += clear_account_investment_catalog()
         removed += clear_challenge_locale()
+        _forget_asset_prefetch()
     elif scope == "icon":
         removed += clear_render_asset_caches()
         removed += gacha_asset_cache.clear_caches()
@@ -3749,6 +3758,7 @@ async def _clear_endfield_caches(scope: str) -> int:
         removed += await clear_http_cache("endfield-account")
         removed += await clear_http_cache("endfield-gacha")
         removed += await clear_http_cache("endfield-official-calendar")
+        _forget_asset_prefetch()
     elif scope in {"operator", "weapon", "equipment", "stage"}:
         removed += await _LOADOUT_CACHE.clear()
         removed += await service.clear_query_caches()
@@ -3767,6 +3777,12 @@ async def _clear_endfield_caches(scope: str) -> int:
     return removed
 
 
+def _forget_asset_prefetch() -> None:
+    """After clearing images: drop the restart hot set and queued prefetches (refills keep going)."""
+    asset_broker.hotset.clear()
+    asset_broker.cancel_background()
+
+
 async def _cache_status_lines() -> list[str]:
     api_stats = await get_http_cache_stats("endfield-api")
     asset_stats = await get_http_cache_stats("endfield-assets")
@@ -3783,7 +3799,22 @@ async def _cache_status_lines() -> list[str]:
         _format_cache_stats("配装卡片", loadout_stats),
         _format_cache_stats("账号卡片", account_stats),
         _format_memory_pools(diagnostics),
+        *_format_asset_queue(diagnostics.get("broker")),
         f"缓存策略: 成品图 TTL {int(RENDER_CACHE_TTL_SECONDS)}s / 下载并发 8",
+    ]
+
+
+def _format_asset_queue(snapshot: dict | None) -> list[str]:
+    """In-flight and queued asset downloads by priority, and today's prefetch traffic."""
+    if not snapshot:
+        return []
+    waiting = snapshot["waiting"]
+    prefetch = snapshot["prefetch"]
+    mib = 1024 * 1024
+    return [
+        f"素材队列: 在途 {snapshot['inflight']} / 排队 交互 {waiting['interactive']} "
+        f"续传 {waiting['refill']} 后台 {waiting['background']} / 续传中 {snapshot['refill']} / "
+        f"今日预取 {prefetch['bytes'] / mib:.1f} MiB / 剩余 {prefetch['remaining_bytes'] / mib:.1f} MiB"
     ]
 
 
@@ -3894,11 +3925,30 @@ def _parse_query(rest: str) -> tuple[str, str]:
 
 _ownership_startup_started = False
 _ownership_startup_task: asyncio.Task | None = None
+_asset_hotset_task: asyncio.Task | None = None
+# 启动后先让 manifest 与挑战文本预热跑一会儿，再在后台预取热集。
+ASSET_HOTSET_DELAY_SECONDS = 5.0
 
 
 @on_ready
 async def _warmup_challenge_i18n(_bot=None) -> None:
     start_challenge_locale_warmup()
+
+
+async def _prefetch_asset_hotset() -> None:
+    await asyncio.sleep(ASSET_HOTSET_DELAY_SECONDS)
+    try:
+        await asset_broker.prefetch_hotset()
+    except Exception as exc:
+        logger.warning(f"[endfield] asset hot set prefetch unavailable error_type={type(exc).__name__}")
+
+
+@on_ready
+async def _warmup_asset_hotset(_bot=None) -> None:
+    """Re-warm the disk with images queries used in the last 24 h (only stale or missing ones)."""
+    global _asset_hotset_task
+    if _asset_hotset_task is None or _asset_hotset_task.done():
+        _asset_hotset_task = asyncio.create_task(_prefetch_asset_hotset())
 
 
 async def _refresh_due_ownership_snapshots() -> None:
@@ -3955,7 +4005,7 @@ timer.add_job(
 @listen(Cleanup)
 async def _close_ownership_startup_task() -> None:
     startup_tasks = [
-        task for task in (_ownership_startup_task,)
+        task for task in (_ownership_startup_task, _asset_hotset_task)
         if task is not None and not task.done()
     ]
     for task in startup_tasks:

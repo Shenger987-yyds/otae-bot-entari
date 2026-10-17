@@ -34,12 +34,14 @@ REMOTE_ASSET_NAMESPACE = "endfield-assets"
 ACCOUNT_UI_ASSET_NAMESPACE = "endfield-account-ui-assets"
 GACHA_IMAGE_NAMESPACE = "endfield-gacha-images"
 _ASSET_NAMESPACES = {REMOTE_ASSET_NAMESPACE, ACCOUNT_UI_ASSET_NAMESPACE}
-# 资料卡与抽卡横幅按同一 URL 取 characterportrait 立绘与物品图标，磁盘缓存键却带命名空间：
-# 立绘原图十几 MB，抽卡横幅已存过的副本干员卡查不到，只能冷下载到超出预算、立绘位留空。
-# 两边互相借用对方的磁盘副本（公共图片，谁下载的字节都一样）。
+# 资料卡、抽卡横幅与账号总览卡按同一 URL 取立绘、头像与物品图标，磁盘缓存键却带命名空间：
+# 立绘原图十几 MB，抽卡横幅已存过的副本干员卡查不到，只能冷下载到超出预算、立绘位留空；
+# 账号详情卡（资料卡命名空间）预取到的头像，账号总览卡也查不到。
+# 三方互相借用磁盘副本（公共图片，谁下载的字节都一样）。
 _SHARED_IMAGE_NAMESPACES = {
-    REMOTE_ASSET_NAMESPACE: (GACHA_IMAGE_NAMESPACE,),
-    GACHA_IMAGE_NAMESPACE: (REMOTE_ASSET_NAMESPACE,),
+    REMOTE_ASSET_NAMESPACE: (GACHA_IMAGE_NAMESPACE, ACCOUNT_UI_ASSET_NAMESPACE),
+    GACHA_IMAGE_NAMESPACE: (REMOTE_ASSET_NAMESPACE, ACCOUNT_UI_ASSET_NAMESPACE),
+    ACCOUNT_UI_ASSET_NAMESPACE: (REMOTE_ASSET_NAMESPACE, GACHA_IMAGE_NAMESPACE),
 }
 
 

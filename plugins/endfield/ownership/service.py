@@ -17,6 +17,7 @@ from otae_bot.adapters.onebot import call_onebot_action
 from ..account.client import EndfieldAPIError, EndfieldOfficialClient, is_asia_role
 from ..account.crypto import CredentialCipher, CredentialKeyError
 from ..account.i18n import localized_text, semantic_label
+from ..account.prefetch import prefetch_detail_assets
 from ..account.store import (
     EndfieldRole,
     EndfieldStore,
@@ -825,6 +826,8 @@ class OwnershipStatsService:
                         token = self.store.decrypt_token(role, cipher)
                         requested += 1
                         detail = await _background_card_detail(self.client, token, role)
+                        # The detail is already here: warm the account cards' images on disk too.
+                        prefetch_detail_assets(detail, source="ownership")
                         members, game_saved_at = parse_operator_snapshot(detail, catalog)
                         succeeded_at = fixed_timestamp or int(time.time())
                         self.store.replace_operator_snapshot(

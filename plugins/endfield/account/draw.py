@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ..rendering.health import record_asset_seconds, record_assets
+from ..rendering.health import record_asset_seconds, record_assets, record_batch_stats
 
 import hashlib
 import html
@@ -18,6 +18,7 @@ from otae_bot.infrastructure.rendering.browser import BrowserResource, screensho
 from otae_bot.infrastructure.rendering.temp_files import schedule_temp_file_cleanup
 from otae_bot.paths import PROJECT_ROOT
 
+from ..cold_start import shared_image_namespaces
 from .models import AccountUiPayload, JsonObject
 from .i18n import localized_text, semantic_label
 from ..providers.assets import sprite_png
@@ -426,13 +427,16 @@ async def _prepare_assets(urls: Iterable[Any], *, inline: bool) -> _PreparedAsse
     # 图床的 404 与超时都是间歇的：走共享的退避重试。这里以前是单次 fetch_many，
     # 一次抖动就静默丢图；缺图原因由 fetch_many_resilient 自己写日志。
     # 超时、重试、按主机熔断与整卡预算取素材通道配置，到点未取到的按缺失留空。
+    # 账号详情卡（资料卡命名空间）与抽卡已存的同一张图直接借用，不再各下一份。
     fetched = await fetch_many_resilient(
         unique_urls,
         namespace=REMOTE_ASSET_NAMESPACE,
         max_bytes=24 * 1024 * 1024,
         log_prefix="[endfield]",
+        disk_aliases=shared_image_namespaces(REMOTE_ASSET_NAMESPACE),
     )
     resources = fetched[0] if isinstance(fetched, tuple) else fetched
+    record_batch_stats(getattr(fetched, "stats", None))
     output: dict[str, str] = {}
     browser_resources: dict[str, BrowserResource] = {}
     for url, resource in resources.items():
