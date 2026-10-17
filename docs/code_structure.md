@@ -12,6 +12,7 @@ otae_bot/
   group_features.py            按机器人账号和群保存插件开关
   attendance_registry.py       双游戏签到：游戏注册表与调度循环（不导入插件）
   attendance_delivery.py       双游戏签到：结果卡拼接、发送与文字回退
+  group_permissions.py         当前机器人账号、当前群的管理员权限核验
   paths.py                     随源码定位的资源根目录
   config/                      环境变量解析、原有路径配置
   adapters/                    Entari 会话/命令/定时任务、OneBot、消息构造、[message] 日志脱敏
@@ -38,6 +39,7 @@ plugins/
     gacha/                     抽卡同步、分析、素材、小黑盒导入、分析图（draw.py）
     stages/                    公开关卡模型、来源和卡片
     calendar/                  AkeData 与官方版本日历
+    announcements/             官网公告采集、订阅与定时提醒
     medals/                    奖章快照存储
     ownership/                 持有率聚合与渲染
     rendering/                 共享卡片、HTML、素材处理
@@ -82,7 +84,8 @@ tests/                         功能回归、结构约束、真实插件加载�
 热重载后重新安装。`ChainMsg.send(dest, bot)` 根据 Entari 订阅器上下文识别
 所属插件，对群推送应用同一开关。后台任务应通过共享 `timer` 注册，
 并使用 `ChainMsg.send` 发送群消息，以保留插件归属和目标群过滤。
-管理命令及权限核验位于 `plugins/group_manager/`，用法见 [群内功能管理](group_features.md)。
+管理命令位于 `plugins/group_manager/`；当前群权限核验由 `otae_bot/group_permissions.py`
+提供，公告订阅复用同一套规则。用法见 [群内功能管理](group_features.md)。
 
 增加终末地功能时，将模型、解析/服务及绘图放入对应业务域，在 `handlers.py`
 接入命令与交互。涉及静态资料转换时优先使用 `catalog/views`，

@@ -63,6 +63,7 @@ from otae_bot.infrastructure.rendering.temp_files import schedule_temp_file_clea
 
 from .providers.warfarin import WarfarinAPIError, WarfarinClient
 from .rendering.health import track_render_health
+from .announcements.runtime import AnnouncementRuntime
 from .account.detail.names import clear_account_detail_name_map
 from .account.investment.service import clear_account_investment_catalog
 from .account.prefetch import prefetch_detail_assets
@@ -478,6 +479,8 @@ async def _handle_command(matcher, event: Event, command: ParsedEndfieldCommand,
         return await _finish_endfield_help(matcher)
     if command.action == "source":
         return await matcher.finish(format_source())
+    if command.action == "announcements":
+        return await matcher.finish(await announcement_runtime.command(event, command.args, bot))
     if command.action == "calendar":
         with cold_start_command(matcher):
             await notice_default_ake_public()
@@ -3958,6 +3961,23 @@ _asset_hotset_task: asyncio.Task | None = None
 # 启动后先让 manifest 与挑战文本预热跑一会儿，再在后台预取热集。
 ASSET_HOTSET_DELAY_SECONDS = 5.0
 
+announcement_runtime = AnnouncementRuntime()
+
+
+@on_ready
+async def _start_announcement_reminders(_bot=None) -> None:
+    announcement_runtime.ready(_bot)
+
+
+async def _poll_announcement_reminders() -> None:
+    await announcement_runtime.tick()
+
+
+timer.add_job(
+    _poll_announcement_reminders, "interval", minutes=1,
+    id="endfield_announcement_reminders", replace_existing=True, max_instances=1,
+)
+
 
 @on_ready
 async def _warmup_challenge_i18n(_bot=None) -> None:
@@ -4033,6 +4053,7 @@ timer.add_job(
 
 @listen(Cleanup)
 async def _close_ownership_startup_task() -> None:
+    await announcement_runtime.close()
     startup_tasks = [
         task for task in (_ownership_startup_task, _asset_hotset_task, *_background_tasks)
         if task is not None and not task.done()
