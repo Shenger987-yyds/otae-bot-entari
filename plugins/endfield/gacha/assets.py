@@ -9,6 +9,8 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Iterable
 
+import cv2
+import numpy as np
 from PIL import Image
 from loguru import logger
 
@@ -17,7 +19,7 @@ from otae_bot.infrastructure.http.client import fetch_many_resilient
 
 from ..account.store import GachaRecord
 from ..cold_start import GACHA_IMAGE_NAMESPACE, shared_image_namespaces
-from ..providers.assets import item_icon_urls, operator_icon_urls, operator_portrait_urls, unique_urls
+from ..providers.assets import item_icon_urls, operator_icon_urls, operator_portrait_urls, sprite_png, unique_urls
 from ..catalog.service import EndfieldService
 from .pools import kind_for_record, resolve_pool_kind, series_key as build_series_key
 
@@ -29,6 +31,16 @@ IMAGE_NAMESPACE = GACHA_IMAGE_NAMESPACE
 POOL_ARTICLE_PREFIX = "卡池/"
 KEEPSAKE_ARTICLE_PREFIX = "物品/干员信物/"
 IMAGE_FETCH_MAX_BYTES = 24 * 1024 * 1024
+# 角色池横幅从 characterportrait（2048² 全身立绘，人物位置各不相同）裁半身。单 UP 池的官方页签
+# （gachapool_type_*，152×100）就是从这张立绘裁出的头像：在缩小的立绘里匹配到它就知道头在哪，
+# 以头为中心裁。匹配不上时按现有限定干员的中位位置裁。头像图标是另画的大头，不能拿来裁。
+BANNER_ASPECT = 86 / 80                 # v3 .pool-head 横幅框（最小高度时）
+BANNER_TAB_WIDTHS = 2.8                 # 裁切宽 = 页签宽 × 2.8：头到胸
+BANNER_WIDTH_RANGE = (0.25, 0.6)        # 裁切宽占立绘宽的上下限，误匹配也不会裁成大头
+BANNER_FACE_POSITION = (0.48, 0.32)     # 头部中心在裁切框里的位置
+BANNER_DEFAULT_FOCUS = (0.49, 0.34, 0.12)   # (中心 x, 中心 y, 页签宽)，按立绘宽度归一化
+BANNER_MATCH_WIDTH = 512                # 匹配时立绘缩到的宽度
+BANNER_MATCH_MIN_SCORE = 0.6            # 实测 11 名限定干员 0.91–0.98
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +68,7 @@ class GachaPoolRule:
     client_top_time_id: str = ""  # 武器表；"" 且 sort_id == 0 ⇒ 常驻申领
     kind_key: str = ""            # prepare_pool_rules 内识别后缓存
     series_key: str = ""
+    tab_image: str = ""           # 角色池表 tabImage（sprites/gachapool 下的卡池页签）
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,10 +247,16 @@ class EndfieldGachaAssetCache:
             if item_id
         ))
         catalog = await self._load_catalog(required_ids=requested_ids)
+        # 联合池的页签是多人拼图，只取单 UP 池的页签来定位头部。
+        tab_ids: dict[str, str] = {}
+        for rule in pool_rules.values():
+            if rule.tab_image and len(rule.up_item_ids) == 1:
+                tab_ids.setdefault(rule.up_item_ids[0], f"pooltab_{rule.tab_image}")
         cache_items: list[GachaItemMetadata] = []
-        cache_ids: dict[str, str] = {}
         banner_candidates: dict[str, tuple[str, ...]] = {}
         resolved_items: dict[str, GachaItemMetadata] = {}
+        portrait_ids: dict[str, str] = {}
+        character_paths: dict[str, str] = {}
         for item_id in requested_ids:
             item = catalog.get(item_id) or GachaItemMetadata(
                 item_id,
@@ -247,26 +266,40 @@ class EndfieldGachaAssetCache:
             )
             resolved_items[item_id] = item
             if item.item_type == "角色" or item_id.startswith("chr_"):
-                cache_id = f"banner_{item_id}"
+                # 半身图还新鲜就直接用，不必再取十几 MB 的立绘。
+                if existing := self._existing_character_banner(item_id):
+                    character_paths[item_id] = existing
+                    continue
+                cache_id = portrait_ids[item_id] = f"banner_{item_id}"
                 cache_items.append(replace(item, item_id=cache_id, item_type="角色"))
                 banner_candidates[cache_id] = operator_portrait_urls(item_id)
+                tab_id = tab_ids.get(item_id)
+                if tab_id and tab_id not in banner_candidates:
+                    tab = tab_id.removeprefix("pooltab_")
+                    cache_items.append(GachaItemMetadata(tab_id, tab, 0, "卡池"))
+                    banner_candidates[tab_id] = unique_urls(sprite_png("gachapool", tab))
             else:
-                cache_id = item_id
                 cache_items.append(item)
-                banner_candidates[cache_id] = item_icon_urls(item_id, item.icon_url)
-            cache_ids[item_id] = cache_id
+                banner_candidates[item_id] = item_icon_urls(item_id, item.icon_url)
         cached_paths = await self._cache_images(cache_items, candidates=banner_candidates)
+        # 立绘取不到就不放横幅，不拿头像图标顶替。
+        crops = {
+            item_id: (cached_paths[cache_id], cached_paths.get(tab_ids.get(item_id, ""), ""))
+            for item_id, cache_id in portrait_ids.items()
+            if cached_paths.get(cache_id)
+        }
+        cropped = await asyncio.gather(*(
+            asyncio.to_thread(self._crop_character_banner, item_id, source, tab)
+            for item_id, (source, tab) in crops.items()
+        ))
+        character_paths.update(zip(crops, cropped))
         banners_by_item: dict[str, GachaPoolBanner] = {}
         for item_id in requested_ids:
             item = resolved_items[item_id]
-            cache_id = cache_ids[item_id]
-            image_path = (
-                cached_paths.get(cache_id)
-                or self._existing_icon_path(cache_id)
-                or self._existing_icon_path(item_id)
-            )
-            if (item.item_type == "角色" or item_id.startswith("chr_")) and image_path:
-                image_path = self._crop_character_banner(item_id, image_path)
+            if item.item_type == "角色" or item_id.startswith("chr_"):
+                image_path = character_paths.get(item_id, "")
+            else:
+                image_path = cached_paths.get(item_id) or self._existing_icon_path(item_id)
             banners_by_item[item_id] = GachaPoolBanner(
                 item_id,
                 item.name,
@@ -304,6 +337,7 @@ class EndfieldGachaAssetCache:
                 sort_id=_safe_int(row.get("sort_id"), 0),
                 pool_version=_safe_int(row.get("pool_version"), 0),
                 client_top_time_id=str(row.get("client_top_time_id") or ""),
+                tab_image=str(row.get("tab_image") or ""),
             )
         if native:
             logger.info("[endfield] gacha pool metadata source=AKEData guarantee source=FZ-or-unknown")
@@ -583,20 +617,27 @@ class EndfieldGachaAssetCache:
         except (OSError, ValueError):
             return str(source.resolve()) if source.is_file() else source_path
 
-    def _crop_character_banner(self, item_id: str, source_path: str) -> str:
+    def _character_banner_path(self, item_id: str) -> Path:
+        # v1 可能是拿头像图标裁出的眼部特写，换版本号整批作废。
+        return self.cache_dir / f"banner_bust_v2_{_safe_item_id(item_id)}.webp"
+
+    def _existing_character_banner(self, item_id: str) -> str:
+        path = self._character_banner_path(item_id)
+        if path.is_file() and path.stat().st_size > 0 and self._fresh_file(path):
+            return str(path.resolve())
+        return ""
+
+    def _crop_character_banner(self, item_id: str, source_path: str, tab_path: str = "") -> str:
         source = Path(source_path)
-        target = self.cache_dir / f"banner_bust_v1_{_safe_item_id(item_id)}.webp"
+        target = self._character_banner_path(item_id)
         try:
             if (target.is_file() and target.stat().st_size > 0 and self._fresh_file(target)
                     and target.stat().st_mtime_ns >= source.stat().st_mtime_ns):
                 return str(target.resolve())
             with Image.open(source) as opened:
                 image = opened.convert("RGBA")
-            crop_width = max(1, round(image.width * 0.50))
-            crop_height = max(1, round(crop_width / 1.48))
-            left = max(0, (image.width - crop_width) // 2)
-            top = max(0, min(image.height - crop_height, round(image.height * 0.19)))
-            cropped = image.crop((left, top, left + crop_width, top + crop_height))
+            focus = (_locate_pool_tab(image, tab_path) if tab_path else None) or BANNER_DEFAULT_FOCUS
+            cropped = image.crop(_character_banner_box(image.size, focus))
             target.parent.mkdir(parents=True, exist_ok=True)
             temporary = target.with_suffix(".webp.tmp")
             cropped.save(temporary, format="WEBP", quality=90, method=6)
@@ -604,6 +645,57 @@ class EndfieldGachaAssetCache:
             return str(target.resolve())
         except (OSError, ValueError):
             return str(source.resolve()) if source.is_file() else source_path
+
+
+def _grey_backed_luma(image: Image.Image) -> np.ndarray:
+    """透明处垫中灰再转灰度：立绘是透明底，页签是满底，两边按同一底色比。"""
+    rgba = image.convert("RGBA")
+    backed = Image.new("RGBA", rgba.size, (200, 200, 200, 255))
+    backed.alpha_composite(rgba)
+    return np.asarray(backed.convert("L"))
+
+
+def _locate_pool_tab(portrait: Image.Image, tab_path: str) -> tuple[float, float, float] | None:
+    """在缩小的立绘里多尺度匹配卡池页签；返回 (中心 x, 中心 y, 页签宽)，按立绘宽度归一化。"""
+    try:
+        with Image.open(tab_path) as opened:
+            tab = _grey_backed_luma(opened)
+        if tab.std() < 4:  # 纯色图在哪儿都能“匹配”
+            return None
+        scale = BANNER_MATCH_WIDTH / portrait.width
+        haystack = _grey_backed_luma(
+            portrait.resize((BANNER_MATCH_WIDTH, max(1, round(portrait.height * scale))), Image.Resampling.BOX)
+        )
+        best_score, best = BANNER_MATCH_MIN_SCORE, None
+        for width in range(BANNER_MATCH_WIDTH // 20, BANNER_MATCH_WIDTH // 3, 2):
+            height = round(width * tab.shape[0] / tab.shape[1])
+            if height < 8 or height > haystack.shape[0]:
+                continue
+            template = cv2.resize(tab, (width, height), interpolation=cv2.INTER_AREA)
+            scores = np.nan_to_num(cv2.matchTemplate(haystack, template, cv2.TM_CCOEFF_NORMED), nan=-1.0)
+            _, score, _, (x, y) = cv2.minMaxLoc(scores)
+            if score > best_score:
+                best_score, best = score, (x + width / 2, y + height / 2, width)
+    except (OSError, ValueError, cv2.error):
+        return None
+    if best is None:
+        return None
+    return tuple(value / BANNER_MATCH_WIDTH for value in best)
+
+
+def _character_banner_box(
+    size: tuple[int, int],
+    focus: tuple[float, float, float],
+) -> tuple[int, int, int, int]:
+    image_width, image_height = size
+    center_x, center_y, tab_width = (value * image_width for value in focus)
+    low, high = BANNER_WIDTH_RANGE
+    width = max(1, round(min(max(tab_width * BANNER_TAB_WIDTHS, image_width * low), image_width * high)))
+    height = min(image_height, max(1, round(width / BANNER_ASPECT)))
+    face_x, face_y = BANNER_FACE_POSITION
+    left = max(0, min(image_width - width, round(center_x - width * face_x)))
+    top = max(0, min(image_height - height, round(center_y - height * face_y)))
+    return left, top, left + width, top + height
 
 
 def apply_gacha_metadata(

@@ -21,6 +21,7 @@ Warfarin、FZ 不再进入候选 URL。正文、技能数值、图鉴名单仍�
 | 干员头像 | `charremoteicon`，不行再 `charicon` | `icon_{charId}` |
 | 圆头 | `charroundicon` | `icon_round_{charId}` |
 | 立绘 / 卡池头图 | `characterportrait` | `{charId}` |
+| 卡池页签（定位头图的头部） | `gachapool` | `GachaCharPoolTable.tabImage`（`gachapool_type_*`） |
 | 技能 / 天赋 | `skillicon` | `CharGrowthTable` 的 `icon` / `iconId` |
 | 武器 / 装备 / 信物 | `itemiconbig`，不行再 `itemicon` | 优先 `ItemTable.iconId`，无映射才用物品 id |
 | 术语小图标 | `termicon` | `icon_term_*` |

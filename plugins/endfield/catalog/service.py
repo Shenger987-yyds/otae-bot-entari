@@ -378,6 +378,7 @@ class EndfieldService:
                     pool_version=_pool_table_int(row.get("gachaPoolVersion"), 0),
                     client_top_time_id=str(row.get("clientTopTimeId") or ""),
                     ui_prefab=str(row.get("uiPrefab") or ""),
+                    tab_image=str(row.get("tabImage") or ""),
                     interval_auto_reward_ids=tuple(
                         str(item) for item in (row.get("intervalAutoRewardIds") or ()) if item
                     ),

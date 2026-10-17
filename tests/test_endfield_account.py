@@ -19,6 +19,7 @@ from io import BytesIO
 from pathlib import Path
 
 import httpx
+import numpy as np
 from PIL import Image, ImageChops
 
 
@@ -2364,45 +2365,89 @@ class EndfieldGachaAssetCacheTests(unittest.IsolatedAsyncioTestCase):
         weapon = gacha_assets_module.GachaItemMetadata(
             "wpn_up", "UP武器", 6, "武器", icon_url="https://assets.fz.wiki/weapon.png",
         )
+        partner = gacha_assets_module.GachaItemMetadata("chr_partner", "联合干员", 6, "角色")
         rules = {
             "character-pool": gacha_assets_module.GachaPoolRule(
-                "character-pool", (operator.item_id,), 120,
+                "character-pool", (operator.item_id,), 120, tab_image="gachapool_type_up",
+            ),
+            "joint-pool": gacha_assets_module.GachaPoolRule(
+                "joint-pool", (partner.item_id, operator.item_id), tab_image="gachapool_type_joint",
             ),
             "weapon-pool": gacha_assets_module.GachaPoolRule(
                 "weapon-pool", (weapon.item_id,), 80,
             ),
         }
-        cache = gacha_assets_module.EndfieldGachaAssetCache(types.SimpleNamespace())
-        with (
-            mock.patch.object(
-                cache, "_load_catalog",
-                mock.AsyncMock(return_value={operator.item_id: operator, weapon.item_id: weapon}),
-            ),
-            mock.patch.object(
-                cache, "_cache_images",
-                mock.AsyncMock(return_value={
-                    "banner_chr_up": "C:/cache/banner_chr_up.webp",
-                    "wpn_up": "C:/cache/wpn_up.png",
-                }),
-            ) as cache_images,
-            mock.patch.object(
-                cache, "_crop_character_banner",
-                return_value="C:/cache/banner_bust_chr_up.webp",
-            ) as crop_character_banner,
-        ):
-            result = await cache.prepare_pool_banners(rules)
+        with tempfile.TemporaryDirectory() as directory:
+            cache = gacha_assets_module.EndfieldGachaAssetCache(types.SimpleNamespace(), cache_dir=directory)
+            with (
+                mock.patch.object(
+                    cache, "_load_catalog",
+                    mock.AsyncMock(return_value={
+                        operator.item_id: operator, partner.item_id: partner, weapon.item_id: weapon,
+                    }),
+                ),
+                mock.patch.object(
+                    cache, "_cache_images",
+                    mock.AsyncMock(return_value={
+                        "banner_chr_up": "C:/cache/banner_chr_up.webp",
+                        "pooltab_gachapool_type_up": "C:/cache/pooltab_gachapool_type_up.png",
+                        "wpn_up": "C:/cache/wpn_up.png",
+                    }),
+                ) as cache_images,
+                mock.patch.object(
+                    cache, "_crop_character_banner",
+                    return_value="C:/cache/banner_bust_chr_up.webp",
+                ) as crop_character_banner,
+            ):
+                result = await cache.prepare_pool_banners(rules)
 
         requested = {item.item_id: item.icon_url for item in cache_images.await_args.args[0]}
-        self.assertEqual(
-            cache_images.await_args.kwargs["candidates"]["banner_chr_up"][0],
-            "https://data.akedata.wiki/public/images/assets/beyond/dynamicassets/gameplay/ui/sprites/characterportrait/chr_up.png",
-        )
+        candidates = cache_images.await_args.kwargs["candidates"]
+        sprites = "https://data.akedata.wiki/public/images/assets/beyond/dynamicassets/gameplay/ui/sprites"
+        self.assertEqual(candidates["banner_chr_up"][0], f"{sprites}/characterportrait/chr_up.png")
+        self.assertEqual(candidates["pooltab_gachapool_type_up"], (f"{sprites}/gachapool/gachapool_type_up.png",))
+        self.assertNotIn("pooltab_gachapool_type_joint", candidates)  # 联合池页签是拼图，不拿来定位
         self.assertEqual(requested["wpn_up"], weapon.icon_url)
         self.assertEqual(result["character-pool"][0].name, "UP干员")
         self.assertEqual(result["character-pool"][0].image_path, "C:/cache/banner_bust_chr_up.webp")
-        crop_character_banner.assert_called_once_with("chr_up", "C:/cache/banner_chr_up.webp")
+        self.assertEqual(result["joint-pool"][0].image_path, "")  # 立绘没取到：不放横幅
+        crop_character_banner.assert_called_once_with(
+            "chr_up", "C:/cache/banner_chr_up.webp", "C:/cache/pooltab_gachapool_type_up.png",
+        )
 
-    def test_character_banner_crop_keeps_centered_upper_body_region(self):
+    async def test_prepare_pool_banners_never_crops_operator_icon_when_portrait_missing(self):
+        # 立绘超出素材预算没取到时，旧版拿记录用的头像图标去裁，裁出来只剩眼睛和额头。
+        operator = gacha_assets_module.GachaItemMetadata("chr_up", "UP干员", 6, "角色")
+        rules = {"pool": gacha_assets_module.GachaPoolRule("pool", (operator.item_id,))}
+        with tempfile.TemporaryDirectory() as directory:
+            cache = gacha_assets_module.EndfieldGachaAssetCache(types.SimpleNamespace(), cache_dir=directory)
+            Image.new("RGBA", (200, 200), (180, 120, 200, 255)).save(Path(directory) / "chr_up.png")
+            with (
+                mock.patch.object(cache, "_load_catalog", mock.AsyncMock(return_value={"chr_up": operator})),
+                mock.patch.object(cache, "_fetch_image_urls", mock.AsyncMock(return_value={})),
+            ):
+                result = await cache.prepare_pool_banners(rules)
+
+            self.assertEqual(result["pool"][0].image_path, "")
+            self.assertEqual(list(Path(directory).glob("banner_bust_*")), [])
+
+    async def test_prepare_pool_banners_reuses_fresh_bust_without_fetching_portrait(self):
+        operator = gacha_assets_module.GachaItemMetadata("chr_up", "UP干员", 6, "角色")
+        rules = {"pool": gacha_assets_module.GachaPoolRule("pool", (operator.item_id,), tab_image="tab_up")}
+        with tempfile.TemporaryDirectory() as directory:
+            cache = gacha_assets_module.EndfieldGachaAssetCache(types.SimpleNamespace(), cache_dir=directory)
+            bust = Path(directory) / "banner_bust_v2_chr_up.webp"
+            Image.new("RGBA", (86, 80), (120, 80, 40, 255)).save(bust)
+            with (
+                mock.patch.object(cache, "_load_catalog", mock.AsyncMock(return_value={"chr_up": operator})),
+                mock.patch.object(cache, "_cache_images", mock.AsyncMock(return_value={})) as cache_images,
+            ):
+                result = await cache.prepare_pool_banners(rules)
+
+            self.assertEqual(cache_images.await_args.args[0], [])
+            self.assertEqual(result["pool"][0].image_path, str(bust.resolve()))
+
+    def test_character_banner_crop_falls_back_to_typical_head_position(self):
         with tempfile.TemporaryDirectory() as directory:
             cache = gacha_assets_module.EndfieldGachaAssetCache(
                 types.SimpleNamespace(), cache_dir=directory,
@@ -2413,8 +2458,43 @@ class EndfieldGachaAssetCacheTests(unittest.IsolatedAsyncioTestCase):
             result = Path(cache._crop_character_banner("chr_up", str(source)))
 
             with Image.open(result) as cropped:
-                self.assertEqual(cropped.size, (500, 338))
-            self.assertEqual(result.name, "banner_bust_v1_chr_up.webp")
+                self.assertEqual(cropped.size, (336, 313))  # 0.12 × 2.8 宽，横幅框比例 86:80
+            self.assertEqual(result.name, "banner_bust_v2_chr_up.webp")
+
+    def test_character_banner_crop_centres_on_matched_pool_tab(self):
+        # 官方卡池页签是立绘的头像裁切：匹配到它的位置，半身图就以那里为头部中心。
+        rng = np.random.default_rng(7)
+        texture = Image.fromarray(rng.integers(0, 256, (48, 48, 3), dtype=np.uint8)).resize(
+            (1024, 1024), Image.Resampling.BICUBIC,
+        )
+        portrait = Image.new("RGBA", (1024, 1024), (0, 0, 0, 0))
+        portrait.paste(texture.crop((150, 100, 950, 1000)).convert("RGBA"), (150, 100))
+        head_x, head_y, head_width = 700, 380, 120
+        head_height = round(head_width * 100 / 152)
+        tab = portrait.crop((
+            head_x - head_width // 2, head_y - head_height // 2,
+            head_x + head_width // 2, head_y + head_height // 2,
+        )).resize((152, 100), Image.Resampling.LANCZOS)
+        with tempfile.TemporaryDirectory() as directory:
+            source, tab_path = Path(directory) / "portrait.png", Path(directory) / "tab.png"
+            portrait.save(source)
+            tab.save(tab_path)
+            cache = gacha_assets_module.EndfieldGachaAssetCache(types.SimpleNamespace(), cache_dir=directory)
+
+            focus = gacha_assets_module._locate_pool_tab(portrait, str(tab_path))
+            result = Path(cache._crop_character_banner("chr_up", str(source), str(tab_path)))
+
+            self.assertIsNotNone(focus)
+            for found, expected in zip(focus, (head_x / 1024, head_y / 1024, head_width / 1024)):
+                self.assertAlmostEqual(found, expected, delta=0.01)
+            left, top, right, bottom = gacha_assets_module._character_banner_box(portrait.size, focus)
+            self.assertAlmostEqual((head_x - left) / (right - left), 0.48, delta=0.02)
+            self.assertAlmostEqual((head_y - top) / (bottom - top), 0.32, delta=0.02)
+            with Image.open(result) as cropped:
+                self.assertEqual(cropped.size, (right - left, bottom - top))
+            # 纯色图哪儿都能“匹配”，直接判为匹配不上，退回典型位置
+            Image.new("RGB", (152, 100), (90, 90, 90)).save(tab_path)
+            self.assertIsNone(gacha_assets_module._locate_pool_tab(portrait, str(tab_path)))
 
     async def test_prepare_keepsakes_uses_fz_item_name_icon_and_cache(self):
         operator = gacha_assets_module.GachaItemMetadata(

@@ -649,6 +649,7 @@ class NativeAkeTests(unittest.IsolatedAsyncioTestCase):
                 "sortId": 12,
                 "gachaPoolVersion": None,
                 "clientTopTimeId": "",
+                "tabImage": "gachapool_type_laevat",
             }
         }
         self.data._tables["GachaWeaponPoolTable"] = {
@@ -683,7 +684,9 @@ class NativeAkeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(unavailable, [])
         self.assertEqual(rules["pool_rerun"].type_code, 6)
         self.assertEqual(rules["pool_rerun"].up_item_ids, ("chr_0016_laevat",))
+        self.assertEqual(rules["pool_rerun"].tab_image, "gachapool_type_laevat")
         self.assertEqual(rules["pool_weapon"].table, "weapon")
+        self.assertEqual(rules["pool_weapon"].tab_image, "")
 
     def test_client_sprite_folder_is_normalized_for_case_sensitive_cdn(self):
         self.assertIn(
