@@ -517,7 +517,6 @@ body{padding:0;
 .fact span{display:block;font-size:12px;font-weight:900;letter-spacing:.12em;color:#4a555c}
 .fact b{display:block;margin-top:6px;font-size:24px;font-weight:950;overflow-wrap:anywhere}
 .ency-section{padding:19px 30px 0}
-.ency-section:last-child{padding-bottom:20px}
 .section-head{display:flex;align-items:center;gap:11px;padding-bottom:10px;border-bottom:4px solid #20252a}
 .section-head::before{content:'';flex:none;width:9px;height:22px;background:var(--accent)}
 .section-head h2{margin:0;font-size:24px;line-height:1;font-weight:950;letter-spacing:.01em}
@@ -603,8 +602,8 @@ p.deco{margin-top:12px;padding:11px 14px;border-left:3px solid #d3d7d1;backgroun
   overflow-wrap:anywhere}
 .catalog-item span{display:block;margin-top:7px;font-size:12px;font-weight:850;color:#7c8480;
   overflow-wrap:anywhere}
-footer{display:flex;justify-content:space-between;gap:20px;padding:13px 30px;background:#20252a;
-  font-size:11.5px;font-weight:900;letter-spacing:.12em;color:#aeb6ba}
+footer{display:flex;justify-content:space-between;gap:20px;margin:24px 30px 24px;padding:13px 20px;
+  background:#20252a;font-size:11px;font-weight:900;letter-spacing:.08em;color:#aeb6ba}
 footer .mono{font-family:Consolas,'SFMono-Regular',monospace;letter-spacing:.04em}
 """
 
