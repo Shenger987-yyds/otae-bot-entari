@@ -597,6 +597,7 @@ class EndfieldAccountDetailPaginationTests(unittest.IsolatedAsyncioTestCase):
 class EndfieldAccountDetailRoutingTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         await endfield._ACCOUNT_PAGE_CACHE.clear()
+        await endfield._CARD_DETAIL_CACHE.clear()
 
     async def asyncTearDown(self):
         await endfield._ACCOUNT_PAGE_CACHE.close()

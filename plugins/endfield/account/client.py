@@ -836,9 +836,9 @@ class EndfieldOfficialClient:
         stale_context: _SklandContext | None = None,
         background: bool = False,
     ) -> _SklandContext:
-        provider, raw_account_token = decode_account_credential(account_token)
+        provider = decode_account_credential(account_token)[0]
         config = _PROVIDER_CONFIGS[provider]
-        key = hashlib.sha256(f"{provider}:{raw_account_token}".encode("utf-8")).hexdigest()[:24]
+        key = account_credential_fingerprint(account_token)
         cached = self._skland_cache.get(key)
         if _usable_skland_context(cached, refresh=refresh, stale_context=stale_context):
             self._skland_metrics["cache_hits"] += 1
@@ -1193,6 +1193,15 @@ def decode_account_credential(value: str) -> tuple[str, str]:
     if not token:
         raise ValueError("账号 Token 不能为空")
     return ACCOUNT_PROVIDER_CN, token
+
+
+def account_credential_fingerprint(account_token: str) -> str:
+    """Stable 24-hex key for a credential; JSON-encoded and bare forms of one token match.
+
+    Used for process-local cache keys only, so tokens never appear in keys.
+    """
+    provider, raw_token = decode_account_credential(account_token)
+    return hashlib.sha256(f"{provider}:{raw_token}".encode()).hexdigest()[:24]
 
 
 def encode_service_token(token: str, provider: str) -> str:

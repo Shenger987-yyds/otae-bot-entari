@@ -182,6 +182,12 @@ class DailyAccountViewTests(unittest.TestCase):
 
 
 class DailyParallelFetchTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        from plugins.endfield import handlers
+
+        # card/detail is reused for 60 s; start from fresh requests.
+        await handlers._CARD_DETAIL_CACHE.clear()
+
     async def test_accounts_load_in_parallel_in_binding_order_and_fail_independently(self):
         from unittest.mock import AsyncMock, Mock, patch
 
