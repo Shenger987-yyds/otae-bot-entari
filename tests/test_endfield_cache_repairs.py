@@ -575,6 +575,11 @@ class DiskCacheTests(unittest.TestCase):
                 "UPDATE public_images_v1 SET content=? WHERE key='b'", (b"wrong",)
             )
             connection.commit()
+            # A row this process already verified is trusted for a while; the
+            # first read in a new process checks the hash and drops the row.
+            reopened = PublicImageDiskCache(Path(directory) / "public.sqlite3", 8)
+            self.assertIsNone(reopened.get("b", 10))
+            reopened.close()
             self.assertIsNone(cache.get("b", 10))
             cache.clear("endfield-")
             cache.put("old", "endfield-assets", value, generation)

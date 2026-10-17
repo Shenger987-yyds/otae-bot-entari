@@ -267,19 +267,32 @@ class ColdStartNoticeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(gets, [])
 
         self.images.flush()  # the fetch queued its row for the background writer
-        connection = self.images._connect()
-        connection.execute(
-            "UPDATE public_images_v1 SET validated_at=?, max_age=?, etag=?, modified=?",
-            (0, 1, "", ""),
+        _key, _eligible, disk_key, _ttl = await http._cache_coordinates(
+            IMAGE_URL,
+            namespace=cold_start.REMOTE_ASSET_NAMESPACE,
+            response_kind="bytes",
+            params=None,
+            headers=None,
+            ttl_seconds=600,
         )
-        connection.commit()
+        generation = self.images.register(cold_start.REMOTE_ASSET_NAMESPACE)
+
+        def store(etag: str):
+            # Rewrite through the cache so its metadata index follows the row.
+            self.images.put(
+                disk_key,
+                cold_start.REMOTE_ASSET_NAMESPACE,
+                DiskImage(b"png-body", "image/png", etag, "", 0, 1),
+                generation,
+            )
+
+        store("")
         self.assertFalse(
             await http.cached_public_resource(
                 IMAGE_URL, namespace=cold_start.REMOTE_ASSET_NAMESPACE, response_kind="bytes"
             )
         )
-        connection.execute("UPDATE public_images_v1 SET etag=?", ('"stale"',))
-        connection.commit()
+        store('"stale"')
         self.assertTrue(
             await http.cached_public_resource(
                 IMAGE_URL, namespace=cold_start.REMOTE_ASSET_NAMESPACE, response_kind="bytes"

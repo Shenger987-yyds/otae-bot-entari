@@ -407,6 +407,136 @@ class BackgroundWriteTests(_Case):
         self.assertEqual(cache._queued_bytes, 0)
 
 
+class MetadataIndexTests(_Case):
+    """进程内元数据索引：写入 / 刷新 / 淘汰 / 清理 / 坏行删除后与真实行一致，加载后不再查库。"""
+
+    def read_traced(self, cache: PublicImageDiskCache) -> list[str]:
+        statements: list[str] = []
+        with cache._read_lock:
+            cache._read_connection().set_trace_callback(statements.append)
+        return statements
+
+    def assert_index_matches_rows(self, cache: PublicImageDiskCache):
+        self.assertTrue(cache.flush(5))
+        with sqlite3.connect(self.path) as connection:
+            rows = {
+                key: (DiskImageMeta(validated_at, max_age, etag, modified), digest)
+                for key, validated_at, max_age, etag, modified, digest in connection.execute(
+                    "SELECT key, validated_at, max_age, etag, modified, digest FROM public_images_v1"
+                )
+            }
+        self.assertTrue(cache.index_loaded)
+        self.assertEqual(
+            {key: (entry.meta, entry.digest) for key, entry in cache._index.items()}, rows
+        )
+        for key, (meta, _digest) in rows.items():
+            self.assertEqual(cache.metadata(key), meta)
+
+    def test_index_follows_every_write_path(self):
+        cache = self.cache(budget=350, max_entries=10)
+        generation = cache.register(NAMESPACE)
+        other = cache.register("endfield-other")
+        cache.put("seed", NAMESPACE, _image(b"s" * 50), generation)
+        self.assertIsNone(cache.metadata("missing"))  # first read loads the index
+        self.assertTrue(cache.index_loaded)
+        for index in range(3):
+            cache.put_later(f"q{index}", NAMESPACE, _image(bytes([index]) * 50), generation)
+        cache.put("o", "endfield-other", _image(b"o" * 50), other)
+        self.assert_index_matches_rows(cache)
+        cache.put("q0", NAMESPACE, _image(b"Q" * 60, etag='"v2"'), generation)  # replace
+        meta = DiskImageMeta(4242.0, 60.0, '"v3"' + "x" * 5000, "")
+        cache.refresh_later("q1", NAMESPACE, meta, generation)
+        cache.refresh_later("gone", NAMESPACE, meta, generation)  # no such row: no index entry
+        self.assert_index_matches_rows(cache)
+        self.assertEqual(len(cache.metadata("q1").etag), 4096)  # stored validators are truncated
+        self.assertNotIn("gone", cache._index)
+        cache.put("big", NAMESPACE, _image(b"b" * 200), generation)  # over budget: evicts LRU rows
+        self.assertNotIn("seed", cache._index)
+        self.assert_index_matches_rows(cache)
+        cache.clear("endfield-other")
+        self.assertNotIn("o", cache._index)
+        self.assert_index_matches_rows(cache)
+        connection = cache._connect()
+        connection.execute("UPDATE public_images_v1 SET content=? WHERE key='big'", (b"x" * 200,))
+        connection.commit()
+        self.assertIsNone(cache.get("big", 1 << 20))  # damaged body: row and index entry go
+        self.assertIsNone(cache.metadata("big"))
+        self.assert_index_matches_rows(cache)
+        cache.clear()
+        self.assertEqual(cache._index, {})
+
+    def test_loaded_index_answers_metadata_without_sql(self):
+        cache = self.cache()
+        generation = cache.register(NAMESPACE)
+        cache.put("row", NAMESPACE, _image(b"x" * 4096, validated_at=7.0), generation)
+        statements = self.read_traced(cache)
+        self.assertEqual(cache.metadata("row").validated_at, 7.0)
+        self.assertEqual(len(statements), 1)  # one metadata-only scan loads the index
+        self.assertNotIn("content", statements[0].lower())
+        statements.clear()
+        for _ in range(5):
+            cache.metadata("row")
+            cache.metadata("absent")
+        self.assertIsNone(cache.metadata("absent"))
+        self.assertEqual(statements, [])
+        self.assertEqual(cache.get_many(["absent", "also-absent"], 1 << 20), {})
+        self.assertEqual(statements, [])  # keys the index knows are absent are not queried
+        cache.close()  # a closed cache reloads its index on next use
+        self.assertFalse(cache.index_loaded)
+        self.assertEqual(cache.metadata("row").validated_at, 7.0)
+
+    def test_get_many_batches_filters_by_size_and_hashes_once(self):
+        cache = self.cache(budget=1 << 22, max_entries=2000)
+        generation = cache.register(NAMESPACE)
+        bodies = {f"k{index:04d}": f"body-{index}".encode() * 3 for index in range(450)}
+        for key, body in bodies.items():
+            cache.put_later(key, NAMESPACE, _image(body), generation)
+        cache.put_later("large", NAMESPACE, _image(b"L" * 5000), generation)
+        self.assertTrue(cache.flush(10))
+        cache.put_later("queued", NAMESPACE, _image(b"in-queue"), generation)
+        statements = self.read_traced(cache)
+        hashed: list[bytes] = []
+        real_sha256 = hashlib.sha256
+        ours = set(bodies.values())
+
+        def counting_sha256(data=b""):
+            if data in ours:  # the patch is process-wide; ignore other threads' hashing
+                hashed.append(data)
+            return real_sha256(data)
+
+        with mock.patch.object(disk_module.hashlib, "sha256", counting_sha256), cache._lock:
+            found = cache.get_many([*bodies, "large", "queued", "absent"], 1000)
+            self.assertEqual(len(hashed), 450)  # first read in this process checks every body
+            hashed.clear()
+            again = cache.get_many([*bodies, "large"], 1000)
+            self.assertEqual(hashed, [])  # verified rows are trusted afterwards
+            single = cache.get("k0001", 1000)
+        self.assertEqual({key: image.content for key, image in found.items() if key in bodies}, bodies)
+        self.assertNotIn("large", found)  # over max_bytes
+        self.assertNotIn("absent", found)
+        self.assertEqual(found["queued"].content, b"in-queue")  # queued rows answer first
+        self.assertEqual(set(again), set(bodies))
+        self.assertEqual(single.digest, real_sha256(bodies["k0001"]).hexdigest())
+        selects = [sql for sql in statements if " IN (" in sql]
+        self.assertEqual(len(selects), 2 + 2 + 1)  # 450 keys -> two batches per call, then get()
+        with mock.patch.object(disk_module.time, "time", return_value=time.time() + disk_module.VERIFY_INTERVAL_SECONDS + 1):
+            with mock.patch.object(disk_module.hashlib, "sha256", counting_sha256):
+                cache.get("k0001", 1000)
+        self.assertEqual(len(hashed), 1)  # the marker expires
+
+    def test_rows_written_by_another_process_appear_after_a_reload(self):
+        writer = self.cache()
+        reader = self.cache()
+        generation = writer.register(NAMESPACE)
+        self.assertIsNone(reader.metadata("row"))  # no database yet: nothing to load
+        writer.put("row", NAMESPACE, _image(b"shared"), generation)
+        self.assertEqual(reader.get("row", 1 << 20).content, b"shared")
+        writer.put("later", NAMESPACE, _image(b"later"), generation)
+        self.assertIsNone(reader.get("later", 1 << 20))  # the loaded index has not seen it
+        reader.close()
+        self.assertEqual(reader.get("later", 1 << 20).content, b"later")
+
+
 def _png(body: bytes, **headers) -> httpx.Response:
     return httpx.Response(200, content=body, headers={"content-type": "image/png", **headers})
 

@@ -12,6 +12,14 @@ transactions; queued rows are visible to ``get``/``metadata`` immediately.
 ``(accessed_at, size)`` index turns the quota check into an index-only
 aggregate and eviction into an index walk, so neither reads stored bodies.
 Expired rows are kept; callers may serve them when revalidation fails.
+
+Row metadata (never bodies) is loaded into an in-process index on first read
+and kept in step with every write, refresh, eviction and clear, so freshness
+checks are dict lookups instead of SQLite reads. Body hashes are checked on
+the first read of a row in this process and then trusted for
+``VERIFY_INTERVAL_SECONDS``; the marker is not persisted, so a restart
+re-verifies. Rows changed by another process are not seen by the index until
+this process reloads it: that only costs a miss, bodies still come from SQLite.
 """
 
 from __future__ import annotations
@@ -23,10 +31,10 @@ import re
 import sqlite3
 import time
 import weakref
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from itertools import islice
 from pathlib import Path
-from threading import Condition, RLock, Thread, current_thread
+from threading import Condition, Lock, RLock, Thread, current_thread
 from urllib.parse import urlsplit
 
 from loguru import logger
@@ -45,6 +53,10 @@ TOUCH_FLUSH_ROWS = 256
 # 写线程空闲多久后退出，有新写入时再启动。
 WRITER_IDLE_SECONDS = 2.0
 EVICT_PAGE_ROWS = 64
+# 一行正文在本进程首次读出时校验一次 SHA-256，之后这么久内信任它，不再重算。
+VERIFY_INTERVAL_SECONDS = 24 * 3600.0
+# get_many 每条 SELECT 最多带多少个 key（低于 SQLite 的变量个数上限）。
+READ_BATCH_KEYS = 400
 
 
 def public_image_request(url, namespace, headers, params, kind):
@@ -105,6 +117,9 @@ class DiskImage:
     modified: str
     validated_at: float
     max_age: float
+    # SHA-256 hex of ``content``; "" when the caller did not compute it.
+    # Reads fill it from the stored column. Not part of equality.
+    digest: str = field(default="", compare=False)
 
 
 @dataclass(frozen=True)
@@ -124,6 +139,17 @@ class _Queued:
     generation: tuple[int, int]
 
 
+@dataclass(frozen=True, slots=True)
+class _IndexRow:
+    """What the index knows about a stored row; the body stays in SQLite."""
+
+    namespace: str
+    meta: DiskImageMeta
+    digest: str
+    # time.time() of the last successful hash check in this process; 0 = never.
+    verified_at: float = 0.0
+
+
 def _refreshed(image: DiskImage, meta: DiskImageMeta) -> DiskImage:
     return replace(
         image,
@@ -131,6 +157,13 @@ def _refreshed(image: DiskImage, meta: DiskImageMeta) -> DiskImage:
         modified=meta.modified,
         validated_at=meta.validated_at,
         max_age=meta.max_age,
+    )
+
+
+def _stored_meta(value: DiskImage | DiskImageMeta) -> DiskImageMeta:
+    """Metadata exactly as the row stores it (validators are truncated)."""
+    return DiskImageMeta(
+        value.validated_at, value.max_age, value.etag[:4096], value.modified[:128]
     )
 
 
@@ -148,11 +181,14 @@ class PublicImageDiskCache:
         self.max_entries = max(1, max_entries)
         # Reads use their own WAL connection, so writes and the schema backfill
         # never block them. Lock order: _read_lock, then _lock (write connection,
-        # schema), then _queue (pending rows, epochs, writer handle). _queue is
-        # never held during SQLite I/O.
+        # schema), then _queue (pending rows, epochs, writer handle), then
+        # _index_lock (leaf). _queue and _index_lock are never held during
+        # SQLite I/O. Index changes are applied under _lock after their commit.
         self._read_lock = RLock()
         self._lock = RLock()
         self._queue = Condition(RLock())
+        self._index_lock = Lock()
+        self._index: dict[str, _IndexRow] | None = None
         self._epochs: dict[str, int] = {}
         self._global_epoch = 0
         self._connection = None
@@ -309,6 +345,9 @@ class PublicImageDiskCache:
                 self._connection = None
             self._schema_ready = False
             self._backfill_from = None
+            # The file may change before the next open; reload the index then.
+            with self._index_lock:
+                self._index = None
 
     def _current(self, queued: dict[str, _Queued], key) -> _Queued | None:
         """A queued row unless a clear made it stale. Caller holds ``_queue``."""
@@ -316,6 +355,53 @@ class PublicImageDiskCache:
         if item is None or item.generation != self.generation(item.namespace):
             return None
         return item
+
+    @property
+    def index_loaded(self) -> bool:
+        """True once metadata lookups are dict reads that never touch SQLite."""
+        return self._index is not None
+
+    def _ensure_index(self) -> dict[str, _IndexRow] | None:
+        """Load every row's metadata once; None while the database does not exist."""
+        index = self._index
+        if index is not None:
+            return index
+        if not self.path.exists():
+            return None
+        with self._read_lock:
+            # Hold the write lock so no commit lands between the scan and publishing it.
+            with self._lock:
+                if self._index is None:
+                    rows = (
+                        self._read_connection()
+                        .execute(
+                            "SELECT key, namespace, validated_at, max_age, etag, modified, "
+                            "digest FROM public_images_v1"
+                        )
+                        .fetchall()
+                    )
+                    loaded = {
+                        key: _IndexRow(
+                            namespace, DiskImageMeta(validated_at, max_age, etag, modified), digest
+                        )
+                        for key, namespace, validated_at, max_age, etag, modified, digest in rows
+                    }
+                    with self._index_lock:
+                        self._index = loaded
+                return self._index
+
+    def _index_apply(self, changes: dict[str, _IndexRow | None]) -> None:
+        """Publish committed row changes (None = row deleted). Caller holds ``_lock``."""
+        if not changes:
+            return
+        with self._index_lock:
+            if self._index is None:
+                return  # not loaded yet: the first load reads the committed rows
+            for key, row in changes.items():
+                if row is None:
+                    self._index.pop(key, None)
+                else:
+                    self._index[key] = row
 
     def metadata(self, key) -> DiskImageMeta | None:
         """Return freshness metadata for one key without reading the body."""
@@ -329,65 +415,116 @@ class PublicImageDiskCache:
             return DiskImageMeta(
                 value.validated_at, value.max_age, value.etag, value.modified
             )
-        if not self.path.exists():
+        index = self._ensure_index()
+        if index is None:
             return None
-        with self._read_lock:
-            row = (
-                self._read_connection()
-                .execute(
-                    "SELECT validated_at, max_age, etag, modified "
-                    "FROM public_images_v1 WHERE key=?",
-                    (key,),
-                )
-                .fetchone()
-            )
+        with self._index_lock:
+            row = index.get(key)
         if row is None:
             return None
-        return DiskImageMeta(*row) if refresh is None else refresh.value
+        return row.meta if refresh is None else refresh.value
 
     def get(self, key, max_bytes):
         """Return the row whatever its age; freshness is the caller's decision."""
+        return self.get_many((key,), max_bytes).get(key)
+
+    def get_many(self, keys, max_bytes) -> dict[str, DiskImage]:
+        """Rows for ``keys`` (any age, at most ``max_bytes`` each), missing keys omitted.
+
+        Queued rows answer first; the rest are read in batches of
+        ``READ_BATCH_KEYS``, skipping keys the index knows are absent.
+        """
         if self.budget <= 0:
-            return None
+            return {}
+        found: dict[str, DiskImage] = {}
+        refreshes: dict[str, DiskImageMeta] = {}
+        pending: list[str] = []
         with self._queue:
-            queued = self._current(self._writes, key)
-            refresh = self._current(self._refreshes, key)
-        if queued is not None:
-            return queued.value if len(queued.value.content) <= max_bytes else None
-        if not self.path.exists():
-            return None
-        with self._read_lock:
-            row = (
-                self._read_connection()
-                .execute(
-                    "SELECT content, digest, content_type, etag, modified, validated_at, max_age "
-                    "FROM public_images_v1 WHERE key=? AND length(content)<=?",
-                    (key, max_bytes),
-                )
-                .fetchone()
-            )
-        if row is None:
-            return None
-        if hashlib.sha256(row[0]).hexdigest() != row[1]:
-            with self._lock:
-                connection = self._connect()
-                try:
-                    with connection:
+            for key in dict.fromkeys(keys):
+                queued = self._current(self._writes, key)
+                if queued is not None:
+                    if len(queued.value.content) <= max_bytes:
+                        found[key] = queued.value
+                    continue
+                pending.append(key)
+                refresh = self._current(self._refreshes, key)
+                if refresh is not None:
+                    refreshes[key] = refresh.value
+        index = self._ensure_index() if pending else None
+        if index is None:
+            return found
+        with self._index_lock:
+            pending = [key for key in pending if key in index]
+        rows = []
+        if pending:
+            with self._read_lock:
+                connection = self._read_connection()
+                for start in range(0, len(pending), READ_BATCH_KEYS):
+                    chunk = pending[start : start + READ_BATCH_KEYS]
+                    rows.extend(
                         connection.execute(
-                            "DELETE FROM public_images_v1 WHERE key=? AND digest=?",
-                            (key, row[1]),
-                        )
-                finally:
-                    if connection.in_transaction:
-                        connection.rollback()
-            return None
-        with self._queue:
-            # LRU order only; written with the next batch instead of on the read path.
-            self._touches[key] = time.time()
-            if len(self._touches) >= TOUCH_FLUSH_ROWS:
-                self._wake()
-        image = DiskImage(row[0], *row[2:])
-        return image if refresh is None else _refreshed(image, refresh.value)
+                            "SELECT key, content, digest, content_type, etag, modified, "
+                            "validated_at, max_age FROM public_images_v1 "
+                            f"WHERE key IN ({','.join('?' * len(chunk))}) AND length(content)<=?",
+                            (*chunk, max_bytes),
+                        ).fetchall()
+                    )
+        now = time.time()
+        with self._index_lock:
+            trusted = {
+                key
+                for key, _content, digest, *_rest in rows
+                if (entry := index.get(key)) is not None
+                and entry.digest == digest
+                and now - entry.verified_at < VERIFY_INTERVAL_SECONDS
+            }
+        verified: dict[str, str] = {}
+        damaged: list[tuple[str, str]] = []
+        for key, content, digest, content_type, etag, modified, validated_at, max_age in rows:
+            if key not in trusted:
+                if hashlib.sha256(content).hexdigest() != digest:
+                    damaged.append((key, digest))
+                    continue
+                verified[key] = digest
+            image = DiskImage(content, content_type, etag, modified, validated_at, max_age, digest)
+            refresh = refreshes.get(key)
+            found[key] = image if refresh is None else _refreshed(image, refresh)
+        if verified:
+            with self._index_lock:
+                for key, digest in verified.items():
+                    entry = index.get(key)
+                    if entry is not None and entry.digest == digest:
+                        index[key] = replace(entry, verified_at=now)
+        if damaged:
+            self._delete_damaged(damaged)
+        read = [key for key, *_rest in rows if key in found]
+        if read:
+            with self._queue:
+                # LRU order only; written with the next batch instead of on the read path.
+                for key in read:
+                    self._touches[key] = now
+                if len(self._touches) >= TOUCH_FLUSH_ROWS:
+                    self._wake()
+        return found
+
+    def _delete_damaged(self, rows: list[tuple[str, str]]) -> None:
+        with self._lock:
+            connection = self._connect()
+            try:
+                with connection:
+                    connection.executemany(
+                        "DELETE FROM public_images_v1 WHERE key=? AND digest=?", rows
+                    )
+            finally:
+                if connection.in_transaction:
+                    connection.rollback()
+            with self._index_lock:
+                index = self._index
+                if index is not None:
+                    for key, digest in rows:
+                        entry = index.get(key)
+                        if entry is not None and entry.digest == digest:
+                            del index[key]
 
     def put(self, key, namespace, value, generation):
         """Synchronous write (scripts and tests); fetches use ``put_later``."""
@@ -401,10 +538,11 @@ class PublicImageDiskCache:
             connection = self._connect()
             try:
                 with connection:
-                    self._store(connection, [(key, namespace, value)])
+                    changes = self._store(connection, [(key, namespace, value)])
             finally:
                 if connection.in_transaction:
                     connection.rollback()
+            self._index_apply(changes)
 
     def put_later(self, key, namespace, value: DiskImage, generation) -> bool:
         """Queue a row for the background writer. Never blocks on SQLite."""
@@ -550,10 +688,11 @@ class PublicImageDiskCache:
                     for key, item in refreshes
                     if item.generation == self.generation(item.namespace)
                 ]
+            changes: dict[str, _IndexRow | None] = {}
             try:
                 with connection:
                     if writes:
-                        self._store(connection, writes)
+                        changes = self._store(connection, writes)
                     if refreshes:
                         now = time.time()
                         connection.executemany(
@@ -579,9 +718,22 @@ class PublicImageDiskCache:
             finally:
                 if connection.in_transaction:
                     connection.rollback()
+            self._index_apply(changes)
+            if refreshes:
+                with self._index_lock:
+                    index = self._index
+                    if index is not None:
+                        for key, meta in refreshes:
+                            entry = index.get(key)
+                            if entry is not None:  # an UPDATE of a missing row changed nothing
+                                index[key] = replace(entry, meta=_stored_meta(meta))
 
-    def _store(self, connection, rows):
-        """Insert rows, evicting least recently used ones only when over budget."""
+    def _store(self, connection, rows) -> dict[str, _IndexRow | None]:
+        """Insert rows, evicting least recently used ones only when over budget.
+
+        Returns the index changes to publish once the transaction commits.
+        """
+        changes: dict[str, _IndexRow | None] = {}
         size_sql = "size" if self._schema_ready else "coalesce(size, length(content))"
         count, total = connection.execute(
             f"SELECT count(*), total({size_sql}) FROM public_images_v1"
@@ -596,10 +748,13 @@ class PublicImageDiskCache:
             ).fetchone()
             if old is not None:
                 connection.execute("DELETE FROM public_images_v1 WHERE key=?", (key,))
+                changes[key] = None
                 count -= 1
                 total -= old[0] or 0
             if total + size > self.budget or count >= self.max_entries:
-                count, total = self._evict(connection, count, total, size, size_sql)
+                count, total = self._evict(connection, count, total, size, size_sql, changes)
+            digest = value.digest or hashlib.sha256(value.content).hexdigest()
+            meta = _stored_meta(value)
             connection.execute(
                 f"INSERT INTO public_images_v1 ({_COLUMNS}) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -607,38 +762,41 @@ class PublicImageDiskCache:
                     key,
                     namespace,
                     value.content,
-                    hashlib.sha256(value.content).hexdigest(),
+                    digest,
                     value.content_type,
-                    value.etag[:4096],
-                    value.modified[:128],
-                    value.validated_at,
-                    value.max_age,
+                    meta.etag,
+                    meta.modified,
+                    meta.validated_at,
+                    meta.max_age,
                     time.time(),
                     size,
                 ),
             )
+            changes[key] = _IndexRow(namespace, meta, digest)
             count += 1
             total += size
+        return changes
 
-    def _evict(self, connection, count, total, incoming, size_sql):
+    def _evict(self, connection, count, total, incoming, size_sql, changes):
         def over():
             return total + incoming > self.budget or count >= self.max_entries
 
         while count > 0 and over():
-            # Covered by the (accessed_at, size) index once the schema is ready.
+            # Ordered by the (accessed_at, size) index; ``key`` is the row's first column.
             victims = connection.execute(
-                f"SELECT rowid, {size_sql} FROM public_images_v1 "
+                f"SELECT rowid, key, {size_sql} FROM public_images_v1 "
                 "ORDER BY accessed_at LIMIT ?",
                 (EVICT_PAGE_ROWS,),
             ).fetchall()
             if not victims:
                 break
-            for rowid, size in victims:
+            for rowid, key, size in victims:
                 if not over():
                     break
                 connection.execute(
                     "DELETE FROM public_images_v1 WHERE rowid=?", (rowid,)
                 )
+                changes[key] = None
                 count -= 1
                 total -= size or 0
         return count, total
@@ -667,16 +825,21 @@ class PublicImageDiskCache:
             try:
                 with connection:
                     if prefix is None:
-                        return dropped + connection.execute(
-                            "DELETE FROM public_images_v1"
+                        removed = connection.execute("DELETE FROM public_images_v1").rowcount
+                    else:
+                        removed = connection.execute(
+                            "DELETE FROM public_images_v1 WHERE substr(namespace, 1, ?)=?",
+                            (len(prefix), prefix),
                         ).rowcount
-                    return dropped + connection.execute(
-                        "DELETE FROM public_images_v1 WHERE substr(namespace, 1, ?)=?",
-                        (len(prefix), prefix),
-                    ).rowcount
             finally:
                 if connection.in_transaction:
                     connection.rollback()
+            with self._index_lock:
+                if self._index is not None:
+                    for key, entry in list(self._index.items()):
+                        if prefix is None or entry.namespace.startswith(prefix):
+                            del self._index[key]
+            return dropped + removed
 
     def register(self, namespace):
         with self._queue:
