@@ -1278,6 +1278,32 @@ class ArknightsAttendanceServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(registry.active_keys(), frozenset())
 
 
+class ArknightsNicknameTests(unittest.TestCase):
+    """森空岛昵称带 #编号，终末地是裸角色名，卡片上统一成裸名。"""
+
+    def test_strips_only_a_trailing_hash_and_ascii_digits(self):
+        strip = models_module.display_nickname
+        self.assertEqual(strip("笙儿#7279"), "笙儿")
+        self.assertEqual(strip("otae#6338"), "otae")
+        self.assertEqual(strip("笙儿"), "笙儿")
+        self.assertEqual(strip(""), "")
+        # 名字本身含 # 或数字时原样保留，避免误伤玩家自己起的名字。
+        self.assertEqual(strip("C#玩家"), "C#玩家")
+        self.assertEqual(strip("#1234"), "#1234")
+        self.assertEqual(strip("1234"), "1234")
+        self.assertEqual(strip("名字#"), "名字#")
+        self.assertEqual(strip("名字#１２３４"), "名字#１２３４")
+        self.assertEqual(strip("A#B#123"), "A#B")
+
+    def test_attendance_view_strips_the_discriminator(self):
+        view = models_module.build_attendance_view(
+            SimpleNamespace(nickname="笙儿#7279", masked_uid="****1234", uid="10001234", channel_name="官服"),
+            client_module.AttendanceResult("success", "签到成功"),
+        )
+        self.assertEqual(view.nickname, "笙儿")
+        self.assertEqual(view.server_label, "官服")
+
+
 # ------------------------------------------------------------------ renderer
 
 

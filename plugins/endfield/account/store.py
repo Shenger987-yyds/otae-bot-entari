@@ -24,6 +24,8 @@ class RoleCandidate:
     server_id: str
     nickname: str
     server_name: str = ""
+    # 森空岛 binding 层的渠道名（官服/B服），与明日方舟取的是同一个字段。
+    channel_name: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +39,7 @@ class EndfieldRole:
     nickname: str
     server_name: str
     is_primary: bool
+    channel_name: str = ""
 
     @property
     def masked_uid(self) -> str:
@@ -205,6 +208,7 @@ class EndfieldStore:
                     server_id TEXT NOT NULL,
                     nickname TEXT NOT NULL DEFAULT '',
                     server_name TEXT NOT NULL DEFAULT '',
+                    channel_name TEXT NOT NULL DEFAULT '',
                     is_primary INTEGER NOT NULL DEFAULT 0,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
@@ -371,6 +375,16 @@ class EndfieldStore:
                     );
                 """
             )
+            role_columns = {
+                str(row["name"])
+                for row in self.conn.execute("PRAGMA table_info(roles)").fetchall()
+            }
+            if "channel_name" not in role_columns:
+                # 渠道名（官服/B服）来自森空岛 binding。旧绑定没有这一列，留空后由
+                # 签到卡回退到 server_name 的地区标签，重新绑定一次即回填。
+                self.conn.execute(
+                    "ALTER TABLE roles ADD COLUMN channel_name TEXT NOT NULL DEFAULT ''"
+                )
             columns = {
                 str(row["name"])
                 for row in self.conn.execute("PRAGMA table_info(gacha_records)").fetchall()
@@ -519,19 +533,22 @@ class EndfieldStore:
                         """
                         INSERT INTO roles(
                             credential_id, qq_user_id, binding_uid, role_id, server_id,
-                            nickname, server_name, is_primary, created_at, updated_at
-                        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            nickname, server_name, channel_name, is_primary, created_at, updated_at
+                        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(qq_user_id, role_id, server_id) DO UPDATE SET
                             credential_id = excluded.credential_id,
                             binding_uid = excluded.binding_uid,
                             nickname = excluded.nickname,
                             server_name = excluded.server_name,
+                            channel_name = CASE WHEN excluded.channel_name != ''
+                                THEN excluded.channel_name ELSE roles.channel_name END,
                             is_primary = CASE WHEN roles.is_primary = 1 OR excluded.is_primary = 1 THEN 1 ELSE 0 END,
                             updated_at = excluded.updated_at
                         """,
                         (
                             credential_id, str(qq_user_id), candidate.binding_uid, candidate.role_id,
                             candidate.server_id, candidate.nickname, candidate.server_name,
+                            getattr(candidate, "channel_name", "") or "",
                             make_primary, now, now,
                         ),
                     )
@@ -1539,7 +1556,9 @@ class EndfieldStore:
         return EndfieldRole(
             id=int(row["id"]), credential_id=int(row["credential_id"]), qq_user_id=str(row["qq_user_id"]),
             binding_uid=str(row["binding_uid"]), role_id=str(row["role_id"]), server_id=str(row["server_id"]),
-            nickname=str(row["nickname"]), server_name=str(row["server_name"]), is_primary=bool(row["is_primary"]),
+            nickname=str(row["nickname"]), server_name=str(row["server_name"]),
+            is_primary=bool(row["is_primary"]),
+            channel_name=str(row["channel_name"]) if "channel_name" in row.keys() else "",
         )
 
     @staticmethod

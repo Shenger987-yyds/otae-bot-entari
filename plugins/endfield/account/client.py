@@ -380,6 +380,7 @@ class EndfieldOfficialClient:
                     server_id=role.server_id,
                     nickname=role.nickname,
                     server_name=role.server_name,
+                    channel_name=role.channel_name or (match.channel_name if match else ""),
                 )
             )
         return result
@@ -1213,6 +1214,8 @@ def _extract_endfield_roles(payload: dict[str, Any]) -> list[RoleCandidate]:
                             or role.get("serverType")
                             or binding.get("channelName")
                         ),
+                        # 渠道名与明日方舟取自同一个 binding 字段（官服/B服）。
+                        channel_name=localized_text(binding.get("channelName"), default=""),
                     )
                 )
     return _dedupe_roles(candidates)
@@ -1348,6 +1351,7 @@ def _extract_gacha_binding_roles(payload: dict[str, Any]) -> list[RoleCandidate]
                         or role.get("server_name")
                         or binding.get("serverName")
                     ),
+                    channel_name=localized_text(binding.get("channelName"), default=""),
                 )
             )
     return _dedupe_roles(result)

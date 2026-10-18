@@ -354,6 +354,15 @@ class AttendanceMilestoneView:
     icon_url: str = ""
 
 
+# Same wording as the Arknights card: both games share one sign-in result, so the
+# headline never echoes the raw API message (which may be an untranslated error).
+ATTENDANCE_STATUS_LABELS = {
+    "success": "签到成功",
+    "already": "今日已签到",
+    "failed": "签到失败",
+}
+
+
 @dataclass(slots=True)
 class AttendanceRoleView:
     nickname: str
@@ -365,6 +374,10 @@ class AttendanceRoleView:
     monthly_count: int | None = None
     calendar_days: int | None = None
     milestones: list[AttendanceMilestoneView] = field(default_factory=list)
+
+    @property
+    def status_label(self) -> str:
+        return ATTENDANCE_STATUS_LABELS.get(self.status, "签到失败")
 
 
 @dataclass(slots=True)

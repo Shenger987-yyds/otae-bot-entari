@@ -150,13 +150,28 @@ def daily_progress_value(value: Any) -> tuple[bool, ...]:
     return tuple(value) if all(isinstance(done, bool) for done in value) else ()
 
 
+def display_nickname(value: Any) -> str:
+    """Drop a trailing ``#1234`` discriminator from a 森空岛 nickname.
+
+    Endfield reports a bare role name, so the two cards only read alike once the
+    discriminator is gone.  This is deliberately not a regex: a name that merely
+    contains ``#`` or digits must survive untouched, so only a trailing ``#``
+    followed by ASCII digits is cut, and only when something precedes it.
+    """
+    name = str(value or "")
+    head, sep, tail = name.rpartition("#")
+    if sep and head.strip() and tail.isascii() and tail.isdigit():
+        return head.rstrip()
+    return name
+
+
 def build_attendance_view(role: Any, result: AttendanceResult) -> AttendanceRoleView:
     """Convert one role plus its API result into a display-only view."""
     status = str(getattr(result, "status", "") or "failed")
     if status not in STATUS_LABELS:
         status = "failed"
     return AttendanceRoleView(
-        nickname=str(getattr(role, "nickname", "") or "未命名角色"),
+        nickname=display_nickname(getattr(role, "nickname", "") or "未命名角色"),
         uid=str(getattr(role, "masked_uid", "") or "****----"),
         full_uid=str(getattr(role, "uid", "") or ""),
         channel_name=str(getattr(role, "channel_name", "") or getattr(role, "server_label", "") or "未知渠道"),

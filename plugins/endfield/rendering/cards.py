@@ -318,10 +318,18 @@ async def draw_attendance_card(view: AttendanceCardView) -> bytes:
                 f'<span class="attendance-reward">{icon}'
                 f'<span>{esc(item.name)} <b>× {item.count}</b></span></span>'
             )
-        rewards = (
-            f'<span class="attendance-rewards">{"".join(reward_parts)}</span>'
-            if reward_parts else "<span>无奖励明细</span>"
-        )
+        # Same three-way copy as the Arknights card: the headline is a fixed status
+        # label and the second line carries the detail, so an expired credential no
+        # longer renders as "<raw API error> / 无奖励明细".
+        if role.status == "success":
+            detail = (
+                f'<span class="attendance-rewards">{"".join(reward_parts)}</span>'
+                if reward_parts else "无奖励明细"
+            )
+        elif role.status == "already":
+            detail = "今日已签到，无需重复签到"
+        else:
+            detail = esc(role.message or "签到失败，请稍后重试")
         monthly_count = (
             f'<div class="attendance-meta"><span>当月累签</span><b>{role.monthly_count} 天</b></div>'
             if role.monthly_count is not None else ""
@@ -330,7 +338,7 @@ async def draw_attendance_card(view: AttendanceCardView) -> bytes:
             f"""
             <section class="attendance-row status-{esc(role.status)}">
               <div class="role-main"><strong>{esc(role.nickname)}</strong><span>{esc(server_name)} · {esc(role.uid)}</span></div>
-              <div class="status"><div class="status-copy"><b>{esc(role.message)}</b><span>{rewards}</span></div>{monthly_count}</div>
+              <div class="status"><div class="status-copy"><b>{esc(role.status_label)}</b><span>{detail}</span></div>{monthly_count}</div>
               {_attendance_milestone_strip(role, reward_icons)}
             </section>
             """

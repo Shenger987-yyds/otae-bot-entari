@@ -1314,6 +1314,25 @@ class EndfieldOfficialClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual((roles[0].nickname, roles[0].server_name), ("中文角色", "China"))
 
+    def test_skland_binding_parser_keeps_channel_name(self):
+        payload = {
+            "code": 0,
+            "data": {"list": [{
+                "appCode": "endfield",
+                "bindingList": [{
+                    "uid": "binding-uid",
+                    "channelName": "官服",
+                    "nickName": "",
+                    "roles": [{"roleId": "role", "serverId": "1", "nickname": "otae", "serverName": "China"}],
+                }],
+            }]},
+        }
+
+        roles = client_module._extract_endfield_roles(payload)
+
+        self.assertEqual((roles[0].nickname, roles[0].server_name, roles[0].channel_name),
+                         ("otae", "China", "官服"))
+
     def test_gacha_binding_parser_keeps_binding_uid_for_each_server_role(self):
         payload = {
             "status": 0,
@@ -4214,6 +4233,28 @@ class EndfieldNeutralCardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body.count("当月累签"), 1)
         self.assertIn("12 天", body)
         self.assertNotIn("None 天", body)
+
+    async def test_attendance_card_labels_status_and_state_copy(self):
+        view = models_module.AttendanceCardView(
+            roles=[
+                models_module.AttendanceRoleView("成功", "****0001", "官服", "success", "签到成功"),
+                models_module.AttendanceRoleView("已签", "****0002", "官服", "already", "今日已签到"),
+                models_module.AttendanceRoleView("失败", "****0003", "官服", "failed", "森空岛凭据已失效"),
+            ],
+        )
+        renderer = mock.AsyncMock(return_value=b"png")
+
+        with mock.patch.object(draw_module, "_draw_neutral_card", renderer):
+            await draw_module.draw_attendance_card(view)
+
+        body = renderer.await_args.args[1]
+        self.assertIn("<b>签到成功</b>", body)
+        self.assertIn("<b>今日已签到</b>", body)
+        self.assertIn("<b>签到失败</b>", body)
+        self.assertIn("今日已签到，无需重复签到", body)
+        self.assertIn("森空岛凭据已失效", body)
+        # 只有成功且无奖励的那一行写“无奖励明细”，失败行显示原因。
+        self.assertEqual(body.count("无奖励明细"), 1)
 
     async def test_attendance_card_shows_diamond_milestone_progress(self):
         icon_url = "data:image/png;base64,AA=="

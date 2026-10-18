@@ -42,7 +42,9 @@ def build_attendance_view(role, result: AttendanceResult) -> AttendanceRoleView:
     return AttendanceRoleView(
         nickname=role.nickname,
         uid=role.masked_uid,
-        server_name=server_label(role.server_name or role.server_id),
+        # 渠道名（官服/B服）与明日方舟取自同一个 binding 字段；旧绑定没有这一列时
+        # 回退到 server_name 的地区标签（国服/亚服），不会凭空编一个渠道。
+        server_name=(getattr(role, "channel_name", "") or server_label(role.server_name or role.server_id)),
         status=result.status,
         message=result.message,
         rewards=[
