@@ -35,6 +35,7 @@ from otae_bot.infrastructure.http.asset_policy import asset_render_budget, asset
 from otae_bot.infrastructure.http.client import fetch_many_resilient
 
 from ..cold_start import note_remote_assets, shared_image_namespaces
+from ..richtext import rich_tag_at, stray_rich_tag_len
 from otae_bot.infrastructure.rendering.executor import run_image_render
 from otae_bot.infrastructure.rendering.browser import (
     BrowserResource,
@@ -4293,9 +4294,16 @@ def highlight_terms(
         rich_tag = _operator_rich_tag_at(text, index)
         if rich_tag:
             kind, tag_id, inner, end_index = rich_tag
-            inner_html = highlight_terms(inner, {}, {}, set())
+            # 内层标签（祀 P2 的 <#ba.consume>）要和顶层一样拿到 term 样式与图标，
+            # 否则嵌在外层里的词条会掉成默认色、也没有图标。
+            inner_html = highlight_terms(inner, term_styles, term_icons, keyword_terms)
             rendered.append(_render_operator_rich_tag(kind, tag_id, inner_html, term_styles, term_icons))
             index = end_index
+            continue
+        stray = stray_rich_tag_len(text, index)
+        if stray:
+            # 配不上的标记直接吞掉：数据畸形时宁可少个颜色，也不能把标记印到卡上。
+            index += stray
             continue
         term = _matched_term_at(text, index, terms)
         if term:
@@ -4327,14 +4335,8 @@ def highlight_terms(
 
 
 def _operator_rich_tag_at(text: str, index: int) -> tuple[str, str, str, int] | None:
-    match = re.match(r"<([@#])([A-Za-z0-9_.-]+)>", text[index:])
-    if not match:
-        return None
-    inner_start = index + len(match.group(0))
-    close_index = text.find("</>", inner_start)
-    if close_index < 0:
-        return None
-    return match.group(1), match.group(2), text[inner_start:close_index], close_index + 3
+    """开标签按深度找配对闭合；嵌套见 ``rendering.richtext``。"""
+    return rich_tag_at(text, index)
 
 
 def _render_operator_rich_tag(

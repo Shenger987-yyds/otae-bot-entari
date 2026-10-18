@@ -19,6 +19,9 @@ from ...providers.assets import (
     skill_icon_urls,
     static_sprite_url,
 )
+from ...richtext import (
+    iter_rich_tags,
+)
 from ..models import (
     LEVEL_COLUMNS,
     TermStyleView,
@@ -432,7 +435,7 @@ def _term_names_from_entry(entry: dict[str, Any]) -> tuple[set[str], set[str]]:
         elif " - " not in raw_name and " " in raw_name:
             own_names.add(raw_name.rsplit(" ", 1)[-1])
     desc = str(entry.get("desc") or "")
-    for _, text in re.findall(r"<[@#]([^>]+)>([^<]+)</>", desc):
+    for _, _, text in iter_rich_tags(desc):
         cleaned = clean_text(text)
         if cleaned and _looks_like_term(cleaned):
             referenced_names.add(cleaned)

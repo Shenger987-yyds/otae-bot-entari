@@ -13,7 +13,6 @@
 from __future__ import annotations
 
 import html
-import re
 from collections.abc import Mapping, Sequence
 from functools import partial
 from time import perf_counter
@@ -32,6 +31,7 @@ from ..rendering.cards import (
     is_height_limit_error,
     optimize_png_container,
 )
+from ..richtext import rich_tag_at, stray_rich_tag_len
 from .models import (
     ArchiveEntryView,
     CatalogGroup,
@@ -68,10 +68,9 @@ _THEMES: dict[str, tuple[str, str, str]] = {
     "catalog": ("#f2c500", "CODEX", "目录"),
 }
 
-# 效果句里的 <@ba.x>…</> 与 <#ba.x>…</>；与 render_weapon_rich_text 同一形状。
-# 不直接调那个函数：它要 WeaponView，还会把没替换掉的 {key} 画成强调文本。
-_LINK_RE = re.compile(r"&lt;[@#]([A-Za-z0-9_.-]+)&gt;(.*?)&lt;/&gt;", re.DOTALL)
-_STYLE_RE = re.compile(r"&lt;#([A-Za-z0-9_.-]+)&gt;(.*?)&lt;/&gt;", re.DOTALL)
+# 效果句里的 <@ba.x>…</> 与 <#ba.x>…</> 交给 rendering.richtext 按深度配对，
+# 嵌套文案（外层强调里再包一个词条）不会把内层标记漏成纯文本。
+# 不走 render_weapon_rich_text：它要 WeaponView，还会把没替换掉的 {key} 画成强调文本。
 
 
 async def _noted_assets(urls):
@@ -747,19 +746,35 @@ def _catalog_item(item, number: int) -> str:
 
 
 def _rich(line: str, styles: Mapping) -> str:
-    """效果句里的 <@>、<#> 着色；颜色来自本卡视图的 term style。"""
-    escaped = _escape(line).replace("\n", "<br>")
+    """效果句里的 <@>、<#> 着色；颜色来自本卡视图的 term style。
 
-    def style_tag(match: re.Match[str]) -> str:
-        term_id, body = match.group(1), match.group(2)
-        style = styles.get(term_id) if styles else None
-        color = getattr(style, "color", "") if style else ""
-        if color and not color.startswith("#"):
-            color = f"#{color}"
-        style_attr = f' style="color:{_attr(color)}"' if color else ""
-        return f"<strong{style_attr}>{body}</strong>"
+    闭合按深度配对（文案允许嵌套），配不上的标记直接吞掉，不落到卡上。
+    """
 
-    return _STYLE_RE.sub(style_tag, _LINK_RE.sub(style_tag, escaped))
+    def render(text: str) -> str:
+        parts: list[str] = []
+        index = 0
+        while index < len(text):
+            tag = rich_tag_at(text, index)
+            if tag is not None:
+                term_id, body, end_index = tag[1], tag[2], tag[3]
+                style = styles.get(term_id) if styles else None
+                color = getattr(style, "color", "") if style else ""
+                if color and not color.startswith("#"):
+                    color = f"#{color}"
+                style_attr = f' style="color:{_attr(color)}"' if color else ""
+                parts.append(f"<strong{style_attr}>{render(body)}</strong>")
+                index = end_index
+                continue
+            stray = stray_rich_tag_len(text, index)
+            if stray:
+                index += stray
+                continue
+            parts.append(_escape(text[index]))
+            index += 1
+        return "".join(parts)
+
+    return render(line).replace("\n", "<br>")
 
 
 def _count_meta(values: Sequence, unit: str = "项") -> str:
