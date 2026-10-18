@@ -4281,13 +4281,24 @@ def highlight_terms(
     term_styles: dict[str, TermStyleView],
     term_icons: dict[str, str],
     keyword_terms: set[str] | None = None,
+    match_plain_terms: bool = True,
 ) -> str:
+    """渲染一段描述；``<@id>…</>`` 与 ``<#id>…</>`` 按深度配对。
+
+    ``match_plain_terms`` 关掉后只认标签、不认裸词条：标签内部的文字已经是该
+    词条的显示名（``<#ba.consume>消耗</>``），再按词条名匹配一次会给同一个词
+    叠两层图标——真实 term_styles 里 ``ba.consume`` 与 ``消耗`` 都是键。
+    """
     if not text:
         return ""
-    terms = sorted(
-        {term for term in (set(term_styles) | set(keyword_terms or set())) if term},
-        key=len,
-        reverse=True,
+    terms = (
+        sorted(
+            {term for term in (set(term_styles) | set(keyword_terms or set())) if term},
+            key=len,
+            reverse=True,
+        )
+        if match_plain_terms
+        else []
     )
     rendered: list[str] = []
     index = 0
@@ -4296,8 +4307,11 @@ def highlight_terms(
         if rich_tag:
             kind, tag_id, inner, end_index = rich_tag
             # 内层标签（祀 P2 的 <#ba.consume>）要和顶层一样拿到 term 样式与图标，
-            # 否则嵌在外层里的词条会掉成默认色、也没有图标。
-            inner_html = highlight_terms(inner, term_styles, term_icons, keyword_terms)
+            # 否则嵌在外层里的词条会掉成默认色、也没有图标；但标签内的文字不再按
+            # 词条名二次匹配，否则同一个词会被内外各画一次图标。
+            inner_html = highlight_terms(
+                inner, term_styles, term_icons, keyword_terms, match_plain_terms=False
+            )
             rendered.append(_render_operator_rich_tag(kind, tag_id, inner_html, term_styles, term_icons))
             index = end_index
             continue

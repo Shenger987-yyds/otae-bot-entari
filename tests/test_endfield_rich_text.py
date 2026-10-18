@@ -59,6 +59,22 @@ class OperatorCardRichTextTest(unittest.TestCase):
         self.assertIn('<span class="term">吸收</span>', html)
         self.assertIn('<span class="vup">', html)
 
+    def test_tag_text_is_not_matched_as_a_term_again(self):
+        # 真实 term_styles 同时有 ba.consume 和 消耗 两个键（AKE 走
+        # _build_fz_term_styles，id 与显示名都进表）；标签内的文字再按词条名匹配
+        # 一次就会给同一个词画两层图标。
+        styles = {
+            "ba.consume": TermStyleView("ba.consume", "#ff8e59", "https://x/c.png"),
+            "消耗": TermStyleView("消耗", "#ff8e59", "https://x/c.png"),
+            "ba.absorb": TermStyleView("ba.absorb", "#5bc8ff", "https://x/a.png"),
+            "吸收": TermStyleView("吸收", "#5bc8ff", "https://x/a.png"),
+        }
+        icons = {term: style.icon_url for term, style in styles.items()}
+        html = highlight_terms(NESTED, styles, icons)
+        self.assertEqual(html.count('class="term-icon"'), 2)
+        self.assertEqual(html.count('class="term"'), 2)
+        self.assertNotIn("term-plain", html)
+
     def test_nested_term_uses_its_own_style(self):
         styles = {"ba.consume": TermStyleView("ba.consume", "#ff8e59", "")}
         html = highlight_terms(NESTED, styles, {})
