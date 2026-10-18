@@ -61,7 +61,7 @@ def render_attendance_card_html(view: AttendanceCardView) -> str:
 *{{box-sizing:border-box}}
 html,body{{margin:0;width:{CARD_WIDTH}px;background:#ededed;color:#222;font-family:'Microsoft YaHei','PingFang SC','Noto Sans SC',Arial,sans-serif}}
 /* Match Endfield's QQ thumbnail ratio: 1280 / 430 stays below 3:1. */
-.ak-card{{width:{CARD_WIDTH}px;min-height:430px;padding:24px;background:#ededed}}
+.ak-card{{width:{CARD_WIDTH}px;min-height:430px;padding:24px;background:linear-gradient(90deg,rgba(0,0,0,.055) 1px,transparent 1px) 0 0/32px 32px,linear-gradient(0deg,rgba(0,0,0,.055) 1px,transparent 1px) 0 0/32px 32px,#ededed}}
 header{{display:flex;justify-content:space-between;align-items:center;gap:24px;margin-bottom:16px;padding:22px 24px;background:#142536;color:#fff;border-bottom:5px solid #54b9ef;border-radius:4px}}
 header>div{{min-width:0}}header small{{font-size:12px;letter-spacing:.16em;color:#b8cbdc}}header h1{{margin:7px 0 0;font-size:34px;line-height:1.2}}header time{{max-width:38%;text-align:right;color:#c7d5e2;font-size:17px;overflow-wrap:anywhere}}
 .empty{{padding:26px;text-align:center;color:#777;background:#f8f8f8;border:1px dashed #ccc;border-radius:8px}}

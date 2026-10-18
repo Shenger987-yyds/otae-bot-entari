@@ -346,7 +346,8 @@ async def draw_attendance_card(view: AttendanceCardView) -> bytes:
            压线可用，重构后单账号内容高度塌到约 310px 才必须点开看全）。
            min-height 提高到 430px（成品约 2560×860，2.98:1），多余空间和旧版一样
            留在卡片下方，行式布局不变。 */
-        .attendance-card{min-height:430px;padding:24px;background:#ededed;color:#222222}
+        /* 背景沿用 _draw_neutral_card 的 32px 网格，不要在这里写纯色覆盖。 */
+        .attendance-card{min-height:430px;padding:24px;color:#222222}
         .attendance-card header{margin-bottom:16px;padding:22px 24px;border:0;border-bottom:5px solid #dfec32;border-radius:4px;background:#292929;gap:24px}
         .attendance-card header small{color:#c8c8c8;font-size:12px;letter-spacing:.16em}
         .attendance-card header h1{font-size:34px;margin-top:7px;line-height:1.2}
