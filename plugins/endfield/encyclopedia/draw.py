@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import html
+import re
 from collections.abc import Mapping, Sequence
 from functools import partial
 from time import perf_counter
@@ -33,13 +34,17 @@ from ..rendering.cards import (
 )
 from ..richtext import rich_tag_at, stray_rich_tag_len
 from .models import (
+    TERM_SOURCE_ROLE_NAMES,
+    TERM_SOURCE_ROLES,
     ArchiveEntryView,
     CatalogGroup,
     EncyclopediaCatalogView,
     EnemyView,
     ItemView,
     PropView,
+    TermSourceView,
     TermView,
+    TermValueRow,
 )
 
 # 版心不写死：卡片按内容撑开，只留上下限。
@@ -65,7 +70,7 @@ _THEMES: dict[str, tuple[str, str, str]] = {
     "enemy": ("#ff623d", "ENEMY", "敌人"),
     "term": ("#8a56d6", "TERM", "词条"),
     "archive_entry": ("#286cd6", "ARCHIVE", "档案"),
-    "catalog": ("#f2c500", "CODEX", "目录"),
+    "catalog": ("#f2c500", "NOTES", "目录"),
 }
 
 # 效果句里的 <@ba.x>…</> 与 <#ba.x>…</> 交给 rendering.richtext 按深度配对，
@@ -300,20 +305,25 @@ def render_term_html(view: TermView, urls: Mapping[str, str]) -> str:
     if view.color:
         accent = view.color if view.color.startswith("#") else f"#{view.color}"
     facts = _spec([("族", view.family), ("关联", _count_meta(view.related, "个"))])
-    related = "".join(f"<i>{_escape(item)}</i>" for item in view.related)
-    sources = "".join(
-        "<div class='entry'>"
-        f"<b class='idx'>{index:02d}</b>"
-        f"<b>{_escape(item.name)}</b><span>{_escape(item.skill)}</span></div>"
-        for index, item in enumerate(view.sources, start=1)
+    labels = view.related_names or view.related
+    related = "".join(f"<i>{_escape(item)}</i>" for item in labels)
+    sections = [("说明", _rich_paragraph(view.summary))]
+    if view.values:
+        sections.append(("数值", _term_values(view), "Lv1–4"))
+    sections.append(
+        (
+            "关联词条",
+            f"<div class='chip-grid'>{related}</div>" if related else "<p class='muted'>无</p>",
+            _count_meta(view.related),
+        )
     )
-    if view.source_total > len(view.sources):
-        sources += f"<div class='entry-more'>还有 {view.source_total - len(view.sources)} 条来源</div>"
-    sections = [
-        ("说明", _rich_paragraph(view.summary)),
-        ("关联词条", f"<div class='chip-grid'>{related}</div>" if related else "<p class='muted'>无</p>", _count_meta(view.related)),
-        ("来源", sources or "<p class='muted'>暂无来源</p>", f"{view.source_total} 条" if view.source_total else ""),
-    ]
+    sections.append(
+        (
+            "来源",
+            _term_sources(view),
+            f"{view.source_total} 条" if view.source_total else "",
+        )
+    )
     return _document(
         "term-card",
         accent,
@@ -367,7 +377,7 @@ def render_catalog_html(view: EncyclopediaCatalogView) -> str:
     hero = f"""
     <header class="hero">
       <div class="hero-main">
-        <div class="hero-kicker"><i class="kicker-mark"></i>ENDFIELD · CODEX<span class="kicker-tag">{_escape(kind_cn)}</span></div>
+        <div class="hero-kicker"><i class="kicker-mark"></i>ENDFIELD · NOTES<span class="kicker-tag">{_escape(kind_cn)}</span></div>
         <h1>{_escape(view.title)}</h1>
         <div class="hero-id">{_escape(subtitle)}</div>
       </div>
@@ -579,6 +589,36 @@ p.deco{margin-top:12px;padding:11px 14px;border-left:3px solid #d3d7d1;backgroun
 .entry span{font-size:13px;font-weight:850;color:#6f7773}
 .entry-more{margin-top:8px;padding:11px 14px;background:rgba(23,27,31,.055);text-align:center;
   font-size:13px;font-weight:850;color:#6f7773}
+/* 词条卡：说明铺满卡宽（620px 的阅读宽度会让尾句掉成孤字），数值区与来源分组 */
+.term-card .section-body p{max-width:none}
+.val-table{border:1px solid rgba(23,27,31,.22);background:rgba(255,255,255,.78)}
+.val-head,.val-row{display:grid;grid-template-columns:minmax(196px,1fr) repeat(4,96px);
+  align-items:center;padding:11px 16px}
+.val-head{background:#20252a;color:#e8ebe6;font-size:12px;font-weight:900;letter-spacing:.12em}
+.val-head b{text-align:center;font-weight:900}
+.val-row{border-bottom:1px solid rgba(23,27,31,.1)}
+.val-row:last-child{border-bottom:none}
+.val-row:nth-child(even){background:rgba(23,27,31,.025)}
+.val-label{font-size:14.5px;font-weight:900;color:#232a30;overflow-wrap:anywhere}
+.val-label em{margin-left:8px;font-style:normal;font-size:11.5px;font-weight:850;
+  letter-spacing:.06em;color:#8d948f}
+.val-row b{text-align:center;font:950 17px/1.2 Consolas,'SFMono-Regular',monospace;
+  color:#171b1f;font-variant-numeric:tabular-nums}
+.val-row b em{margin-left:2px;font-style:normal;font-size:12px;font-weight:850;color:#6f7773}
+.val-row-fixed b{grid-column:2 / span 4}
+.val-note,.src-note{margin-top:10px;font-size:12.5px;line-height:1.6;font-weight:850;color:#727b81}
+.src-group+.src-group{margin-top:13px}
+.src-head{display:flex;align-items:center;gap:9px;margin-bottom:7px}
+.src-tag{padding:4px 10px;color:#fff;font-size:12px;font-weight:900;letter-spacing:.08em}
+.src-count{font-size:12px;font-weight:850;letter-spacing:.08em;color:#727b81}
+.src-apply .src-tag{background:#b83f24}
+.src-enhance .src-tag{background:#1f7a6b}
+.src-trigger .src-tag{background:#5d6873}
+.src-consume .src-tag{background:#9a8530}
+.src-apply .entry{border-left-color:#b83f24}
+.src-enhance .entry{border-left-color:#1f7a6b}
+.src-trigger .entry{border-left-color:#5d6873}
+.src-consume .entry{border-left-color:#9a8530}
 .catalog-group{display:block}
 .group-head{display:flex;align-items:center;gap:11px;padding-bottom:10px;border-bottom:4px solid #20252a}
 .group-head::before{content:'';flex:none;width:9px;height:20px;background:var(--accent)}
@@ -618,7 +658,7 @@ def _css() -> str:
 def _document(klass: str, accent: str, hero: str, body: str, revision: str) -> str:
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><style>{_css()}</style></head>
 <body><main class="ency-card {klass}" style="--accent:{_attr(accent)}"><div class="sheet">{hero}{body}
-<footer><span>ENDFIELD · CODEX · 数据来源 AkeData</span><span class="mono">{_escape(str(revision).split("|", 1)[0])}</span></footer>
+<footer><span>ENDFIELD · NOTES · 数据来源 AkeData</span><span class="mono">{_escape(str(revision).split("|", 1)[0])}</span></footer>
 </div></main></body></html>"""
 
 
@@ -639,7 +679,7 @@ def _hero(
     return f"""
     <header class="hero">
       <div class="hero-main">
-        <div class="hero-kicker"><i class="kicker-mark"></i>ENDFIELD · CODEX<span class="kicker-tag">{_escape(kind_cn)}</span></div>
+        <div class="hero-kicker"><i class="kicker-mark"></i>ENDFIELD · NOTES<span class="kicker-tag">{_escape(kind_cn)}</span></div>
         <h1>{_escape(title)}</h1>
         <div class="hero-id">{_escape(subtitle)}</div>
       </div>
@@ -681,6 +721,71 @@ def _section(title: str, body: str, meta: str = "") -> str:
 def _sections(items: Sequence[tuple]) -> str:
     return "".join(
         _section(item[0], item[1], item[2] if len(item) > 2 else "") for item in items
+    )
+
+
+def _term_values(view: TermView) -> str:
+    """数值区：四档异常等级一列一格；固定值（持续时间、爆发倍率）跨列居中。"""
+    head = "<div class='val-head'><span>配置</span>" + "".join(
+        f"<b>Lv{level}</b>" for level in range(1, 5)
+    ) + "</div>"
+    rows = "".join(_term_value_row(row) for row in view.values)
+    note = f"<p class='val-note'>{_escape(view.values_note)}</p>" if view.values_note else ""
+    return f"<div class='val-table'>{head}{rows}</div>{note}"
+
+
+def _term_value_row(row: TermValueRow) -> str:
+    calc = f"<em>{_escape(row.calc)}</em>" if row.calc else ""
+    label = f"<span class='val-label'>{_escape(row.label)}{calc}</span>"
+    if len(row.values) == 1:
+        return f"<div class='val-row val-row-fixed'>{label}<b>{_val_cell(row.values[0])}</b></div>"
+    cells = "".join(f"<b>{_val_cell(value)}</b>" for value in row.values)
+    return f"<div class='val-row'>{label}{cells}</div>"
+
+
+def _val_cell(value: str) -> str:
+    """数值与单位分开：`12%` / `12 秒` 里的单位用小字，数字保持等宽对齐。"""
+    match = re.match(r"^(-?[0-9.]+)\s*(.*)$", str(value))
+    if match is None:
+        return _escape(value)
+    number, unit = match.groups()
+    unit_html = f"<em>{_escape(unit)}</em>" if unit else ""
+    return f"{_escape(number)}{unit_html}"
+
+
+def _term_sources(view: TermView) -> str:
+    """来源按「施加 / 增强 / 触发 / 消耗」分组；只被提及的引用不进来。"""
+    if not view.sources:
+        body = "<p class='muted'>暂无直接来源</p>"
+        if view.mention_total:
+            body += (
+                f"<p class='src-note'>另有 {view.mention_total} 处技能文本提及该词条，"
+                "但未施加、增强或消耗它</p>"
+            )
+        return body
+    blocks: list[str] = []
+    for role in TERM_SOURCE_ROLES:
+        group = [item for item in view.sources if item.role == role]
+        if not group:
+            continue
+        rows = "".join(_source_row(index, item) for index, item in enumerate(group, start=1))
+        blocks.append(
+            f"<div class='src-group src-{role}'>"
+            f"<div class='src-head'><span class='src-tag'>{_escape(TERM_SOURCE_ROLE_NAMES[role])}</span>"
+            f"<span class='src-count'>{len(group)} 条</span></div>{rows}</div>"
+        )
+    rest = view.source_total - len(view.sources)
+    if rest > 0:
+        blocks.append(f"<div class='entry-more'>还有 {rest} 条来源</div>")
+    return "".join(blocks)
+
+
+def _source_row(index: int, item: TermSourceView) -> str:
+    detail = " · ".join(part for part in (item.kind, item.skill) if part)
+    return (
+        "<div class='entry'>"
+        f"<b class='idx'>{index:02d}</b>"
+        f"<b>{_escape(item.name)}</b><span>{_escape(detail)}</span></div>"
     )
 
 

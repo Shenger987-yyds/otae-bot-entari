@@ -175,10 +175,32 @@ class EnemyView:
     revision: str = ""
 
 
+# 一条技能文案对词条的作用方式；渲染顺序也按这个顺序。
+TERM_SOURCE_ROLES: tuple[str, ...] = ("apply", "enhance", "trigger", "consume")
+TERM_SOURCE_ROLE_NAMES = {
+    "apply": "施加",
+    "enhance": "增强",
+    "trigger": "触发",
+    "consume": "消耗",
+    "mention": "提及",
+}
+
+
 @dataclass(slots=True)
 class TermSourceView:
     name: str
     skill: str = ""
+    role: str = "apply"
+    kind: str = ""
+
+
+@dataclass(slots=True)
+class TermValueRow:
+    """词条数值表的一行：四个异常等级各一个值，或一个固定值（len == 1）。"""
+
+    label: str
+    values: tuple[str, ...] = ()
+    calc: str = ""
 
 
 @dataclass(slots=True)
@@ -191,8 +213,13 @@ class TermView:
     icon_url: str = ""
     summary: str = ""
     related: tuple[str, ...] = ()
+    # 关联词条的中文名，与 `related` 一一对应；画卡片用它，查数据用 id。
+    related_names: tuple[str, ...] = ()
     sources: tuple[TermSourceView, ...] = ()
     source_total: int = 0
+    mention_total: int = 0
+    values: tuple[TermValueRow, ...] = ()
+    values_note: str = ""
     source: str = "akedata"
     revision: str = ""
 

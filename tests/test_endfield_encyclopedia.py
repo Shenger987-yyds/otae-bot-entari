@@ -21,6 +21,7 @@ from plugins.endfield.catalog import commands
 from plugins.endfield.catalog.models import ArchiveItemView, ArchiveSnapshotView
 from plugins.endfield.catalog.views.common import _rich_text_visual
 from plugins.endfield.encyclopedia import classify, index as encyclopedia_index
+from plugins.endfield.catalog.views.constants import LOADOUT_STATUS_LEVELS
 from plugins.endfield.encyclopedia import (
     enemies as encyclopedia_enemies,
     items as encyclopedia_items,
@@ -28,6 +29,8 @@ from plugins.endfield.encyclopedia import (
     service as encyclopedia_service,
     terms as encyclopedia_terms,
 )
+from plugins.endfield.encyclopedia import term_values
+from plugins.endfield.encyclopedia.models import TermView
 from plugins.endfield.providers import repository
 from plugins.endfield.providers.repository import AkeDataIncomplete, AkeSnapshot
 from plugins.endfield.providers.warfarin import WarfarinAPIError
@@ -749,6 +752,13 @@ class EndfieldEncyclopediaTermTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(entry.listed)
         self.assertTrue(classify.term_listed("法术异常 - 燃烧"))
 
+    async def test_related_names_are_chinese_not_raw_ids(self):
+        view = await encyclopedia_terms.build_term_view(self.data, TERM_BURNING)
+        self.assertEqual(len(view.related_names), len(view.related))
+        self.assertIn("灼热", view.related_names)
+        for name in view.related_names:
+            self.assertFalse(name.startswith("ba."), name)
+
     async def test_related_contains_the_companion_and_both_tag_forms(self):
         view = await encyclopedia_terms.build_term_view(self.data, TERM_BURNING)
         self.assertIn("ba.burningonchar", view.related)
@@ -782,6 +792,91 @@ class EndfieldEncyclopediaTermTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(view.color, "#ff8e59")
         self.assertEqual((view.family_id, view.family), ("ba.fire", "灼热"))
 
+    def test_tag_roles_separate_apply_trigger_consume_and_enhance(self):
+        cases = (
+            ("造成物理伤害并施加<#ba.fracture>碎甲</>", "ba.fracture", "apply"),
+            (
+                "当处于物理脆弱或<#ba.fracture>碎甲</>状态的敌人受到伤害时可以发动",
+                "ba.fracture",
+                "trigger",
+            ),
+            (
+                "当有敌人被猛击或者<#ba.fracture>碎甲</>消耗破防层数后可以发动",
+                "ba.fracture",
+                "trigger",
+            ),
+            (
+                "若敌人处于<#ba.conduct>导电</>状态，<#ba.consume>消耗</>其"
+                "<#ba.conduct>导电</>状态并追加一次攻击",
+                "ba.conduct",
+                "consume",
+            ),
+            (
+                "连携技即时协议·闪链施加的<#ba.conduct>导电</>使敌人受到法术伤害提高的效果"
+                "提升至原本的1.33倍",
+                "ba.conduct",
+                "enhance",
+            ),
+            ("命中后额外强制造成一次<#ba.naturalburst>自然爆发</>", "ba.naturalburst", "apply"),
+            ("每当敌人触发<#ba.naturalburst>自然爆发</>的时候", "ba.naturalburst", "trigger"),
+            ("受到伤害时对<#ba.burning>燃烧</>的敌人追加一次攻击", "ba.burning", "mention"),
+            # 「施加X时 / 施加X后」是条件句：装备与武器只是借这个时机给增伤。
+            ("装备者施加<#ba.conduct>导电</>时，全队获得物理和电磁伤害+10%", "ba.conduct", "trigger"),
+            ("当装备者施加<#ba.conduct>导电</>后，电磁伤害+8%", "ba.conduct", "trigger"),
+            (
+                "装备者施加<#ba.burning>燃烧</>或<#ba.conduct>导电</>后，法术伤害+12%",
+                "ba.burning",
+                "trigger",
+            ),
+            ("战技惊霆诀消耗<#ba.conduct>导电</>后返还2点技力", "ba.conduct", "consume"),
+            (
+                "造成电磁伤害并强制施加短暂的<#ba.conduct>导电</>。释放积蓄的能量",
+                "ba.conduct",
+                "apply",
+            ),
+            (
+                "若存在目标，则无论其是否处于<#ba.conduct>导电</>状态，必定生成3柄青霆剑",
+                "ba.conduct",
+                "trigger",
+            ),
+        )
+        for text, term_id, expected in cases:
+            with self.subTest(text=text):
+                roles = encyclopedia_terms._tag_roles(text)
+                self.assertEqual(roles[term_id], expected)
+
+    def test_mention_only_sources_are_hidden_from_the_card(self):
+        view = TermView(term_id="ba.probe", name="测试词条", mention_total=3)
+        html = endfield.encyclopedia_draw._term_sources(view)
+        self.assertIn("暂无直接来源", html)
+        self.assertIn("3 处技能文本提及", html)
+
+    async def test_equipment_and_talent_references_become_sources(self):
+        sources = await encyclopedia_terms.term_sources(self.data)
+        kinds = {row[3] for rows in sources.values() for row in rows}
+        self.assertIn("装备", kinds)
+        self.assertTrue(any(kind.startswith("潜能 ") for kind in kinds))
+        self.assertTrue(any(kind.startswith("天赋 ") for kind in kinds))
+
+    def test_term_values_match_the_loadout_status_levels(self):
+        """图鉴数值与速算用的 LOADOUT_STATUS_LEVELS 必须同源，改一处就得改另一处。"""
+        conduct = {row.label: row.values for row in term_values.term_values("ba.conduct")[0]}
+        fracture = {row.label: row.values for row in term_values.term_values("ba.fracture")[0]}
+        corrupt = {row.label: row.values for row in term_values.term_values("ba.corrupt")[0]}
+        for name, table in (("导电", conduct), ("碎甲", fracture)):
+            with self.subTest(status=name):
+                for level, (value, duration) in enumerate(LOADOUT_STATUS_LEVELS[name]):
+                    self.assertEqual(table[f"{name}持续时间"][level], f"{duration} 秒")
+                    self.assertEqual(
+                        float(table[f"{name}法术伤害提高" if name == "导电" else "碎甲物理伤害提高"][level].rstrip("%")),
+                        round(value * 100, 2),
+                    )
+        # 速算表存的是减抗幅度（正数），图鉴写带符号的减益值，比绝对值。
+        for level, (initial, per_tick, cap) in enumerate(LOADOUT_STATUS_LEVELS["腐蚀"]):
+            self.assertEqual(abs(float(corrupt["腐蚀初始减抗"][level])), initial)
+            self.assertEqual(abs(float(corrupt["腐蚀每跳减抗"][level])), per_tick)
+            self.assertEqual(abs(float(corrupt["腐蚀减抗上限"][level])), cap)
+
     async def test_term_sources_are_built_once_per_revision(self):
         encyclopedia_terms.clear_caches()
         original = encyclopedia_terms._build_sources
@@ -799,24 +894,47 @@ class EndfieldEncyclopediaTermTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_burning_sources_include_an_operator_and_a_weapon_skill(self):
         sources = await encyclopedia_terms.term_sources(self.data)
-        names = {name for name, _ in sources[TERM_BURNING]}
+        names = {row[0] for row in sources[TERM_BURNING]}
         self.assertIn("莱万汀", names)
-        weapon_sourced = {name for name, _ in sources["ba.vup"]}
+        weapon_sourced = {row[0] for row in sources["ba.vup"]}
         self.assertTrue({"塔尔11", "熔铸火焰", "寒夜幽影"} & weapon_sourced)
         view = await encyclopedia_terms.build_term_view(self.data, TERM_BURNING)
-        self.assertEqual(view.source_total, len(sources[TERM_BURNING]))
-        self.assertEqual([(item.name, item.skill) for item in view.sources], list(sources[TERM_BURNING]))
+        order = {"apply": 0, "enhance": 1, "consume": 2, "trigger": 3}
+        direct = sorted(
+            (row for row in sources[TERM_BURNING] if row[2] != "mention"),
+            key=lambda row: order[row[2]],
+        )
+        self.assertEqual(view.source_total, len(direct))
+        self.assertEqual(
+            [(item.name, item.skill, item.role, item.kind) for item in view.sources],
+            direct[: encyclopedia_terms.SOURCE_LIMIT],
+        )
 
-    async def test_source_limit_keeps_the_first_twelve_entries(self):
-        self.assertEqual(encyclopedia_terms.SOURCE_LIMIT, 12)
+    async def test_source_limit_keeps_the_first_entries(self):
+        self.assertEqual(encyclopedia_terms.SOURCE_LIMIT, 20)
         self.assertGreater(len(_tables()["HyperlinkTextTable"]), 12)
 
     async def test_term_html_has_no_image_tag_level_or_multiplier(self):
-        view = await encyclopedia_terms.build_term_view(self.data, TERM_BURNING)
+        view = await encyclopedia_terms.build_term_view(self.data, "ba.physicalvul")
         document = endfield.encyclopedia_draw.render_term_html(view, {})
         for forbidden in ("<image=", "Lv1", "倍率", "源石技艺"):
             self.assertNotIn(forbidden, document)
-        self.assertIn("燃烧", document)
+        self.assertIn("物理脆弱", document)
+        # 没有确认数值的词条不画数值区（样式表里始终有 .val-table，只看正文）。
+        body = document.split("<body>", 1)[1]
+        self.assertNotIn("val-table", body)
+
+    async def test_term_html_draws_level_values_and_grouped_sources(self):
+        view = await encyclopedia_terms.build_term_view(self.data, TERM_BURNING)
+        document = endfield.encyclopedia_draw.render_term_html(view, {})
+        self.assertIn("val-table", document)
+        for level in ("Lv1", "Lv2", "Lv3", "Lv4"):
+            self.assertIn(level, document)
+        # 数值与单位拆开渲染：24<em>%</em>。
+        self.assertIn("24<em>%</em>", document)
+        self.assertIn("ENDFIELD · NOTES", document)
+        self.assertNotIn("CODEX", document)
+        self.assertNotIn("<image=", document)
 
 
 # ------------------------------------------------------------------ §7 档案条目
