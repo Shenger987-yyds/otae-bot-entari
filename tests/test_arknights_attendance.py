@@ -1115,6 +1115,35 @@ class ArknightsCommandTests(unittest.TestCase):
         for expected in ("/ak 绑定", "/ak 账号", "/ak 主账号", "/ak 解绑", "/ak 签到", "UID后四位"):
             self.assertIn(expected, text)
 
+    def test_help_card_covers_binding_and_attendance(self):
+        from otae_bot.infrastructure.rendering import help_cards
+
+        page = next(page for page in help_cards.load_pages() if page.id == "ak")
+        entries = {
+            item.command: item
+            for section in help_cards.iter_sections(page)
+            for item in section.items
+        }
+        for command in (
+            "/ak 绑定", "/ak 账号", "/ak 主账号 <编号>", "/ak 解绑 <编号>",
+            "/ak 签到", "/ak 签到 <编号|昵称|UID后四位>",
+        ):
+            self.assertIn(command, entries)
+        self.assertEqual(entries["/ak 绑定"].badge, "仅私聊")
+        self.assertEqual(entries["/ak 解绑 <编号>"].badge, "仅私聊")
+        text = "\n".join(
+            f"{section.heading} {section.access} "
+            + " ".join(item.command + " " + item.description for item in section.items)
+            + " " + " ".join(section.notes)
+            for section in help_cards.iter_sections(page)
+        )
+        for expected in ("Token", "data.content", "手机号", "官服", "B服", "需私聊机器人使用，群聊不可用"):
+            self.assertIn(expected, text, expected)
+        self.assertEqual(page.title, "明日方舟功能说明")
+        self.assertIn("/ak", page.subtitle)
+        self.assertIn("/明日方舟", page.subtitle)
+        self.assertEqual(page.footnote, "<>必填，[]选填，|任选其一；绑定与解绑请私聊")
+
     def test_selector_failure_messages(self):
         ambiguous = store_module.SelectorResolution(
             None, store_module.AMBIGUOUS, (role("10001234", "1", "甲", primary=True), role("20001234", "2", "乙")), "1234"
@@ -1586,10 +1615,26 @@ class ArknightsHandlerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_help_is_answered_without_storage(self):
         matcher = _FakeMatcher()
-        await self.handlers._dispatch(
-            matcher, _event(private=True), commands_module.parse_command("")
-        )
+        with mock.patch.object(
+            self.handlers, "cached_help_image", mock.AsyncMock(return_value=None)
+        ):
+            await self.handlers._dispatch(
+                matcher, _event(private=True), commands_module.parse_command("")
+            )
         self.assertIn("/ak 签到", matcher.last_text())
+
+    async def test_help_sends_the_card_image_when_available(self):
+        matcher = _FakeMatcher()
+        image = ROOT / "assets/image/help/ak.png"
+        with mock.patch.object(
+            self.handlers, "cached_help_image", mock.AsyncMock(return_value=image)
+        ) as cached:
+            await self.handlers._dispatch(
+                matcher, _event(private=True), commands_module.parse_command("帮助")
+            )
+        cached.assert_awaited_once_with("ak")
+        self.assertEqual(len(matcher.messages), 1)
+        self.assertIsInstance(matcher.messages[0], self.handlers.ChainMsg)
 
     def _bound_store(self):
         directory = tempfile.TemporaryDirectory()
