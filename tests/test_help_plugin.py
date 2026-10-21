@@ -57,6 +57,13 @@ class HelpTopicMapTests(unittest.TestCase):
         self.assertEqual(self.topics["ef"], "endfield")
         self.assertEqual(self.topics["终末地"], "endfield")
 
+    def test_arknights_topics_resolve_to_the_ak_card(self):
+        for alias in ("ak", "明日方舟", "arknights", "森空岛"):
+            self.assertEqual(self.topics[alias], "ak", alias)
+        # TEXT_TOPICS is checked before TOPIC_MAP; leaving "ak" there would
+        # silently shadow the card and answer with plain text again.
+        self.assertNotIn("ak", self.handlers.TEXT_TOPICS)
+
     def test_available_topics_are_either_text_or_image(self):
         """`/help list` may advertise text-only topics, but never a broken image topic."""
         for topic in self.handlers._available_topics():

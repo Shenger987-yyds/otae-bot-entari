@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import sys
+from pathlib import Path
 from typing import Any
 
 from arclet.alconna import Alconna, Args, MultiVar
@@ -19,8 +20,10 @@ from nepattern import AnyString
 
 from otae_bot.adapters.entari import (
     ArgVal,
+    ChainMsg,
     event_user_id,
     is_group,
+    make_image,
     on_alconna,
     prompt,
 )
@@ -35,6 +38,7 @@ from otae_bot.attendance_registry import (
 )
 from otae_bot.group_features import feature_store, scope_from_event
 from otae_bot.infrastructure.http.tls import ashared_ssl_context
+from otae_bot.infrastructure.rendering.help_runtime import cached_help_image
 
 from .attendance import sign_roles
 from .client import ArknightsAPIError, ArknightsClient, extract_account_token
@@ -144,7 +148,7 @@ async def _dispatch(matcher, event: Event, command, bot=None) -> None:
             ACTION_ATTENDANCE,
         }
         if command.action not in handled:
-            return await matcher.finish(format_help())
+            return await _finish_arknights_help(matcher)
 
         user_id = str(event_user_id(event))
         group = is_group(event)
@@ -179,6 +183,14 @@ async def _dispatch(matcher, event: Event, command, bot=None) -> None:
 
 
 # ------------------------------------------------------------------ binding
+
+
+async def _finish_arknights_help(matcher) -> None:
+    # 按页面比例随机挑插画并运行时渲染；渲染不可用时回退到仓库里的静态帮助图。
+    image = await cached_help_image("ak")
+    if image and Path(image).is_file():
+        return await matcher.finish(ChainMsg([make_image(path=str(image))]))
+    return await matcher.finish(format_help())
 
 
 async def _handle_bind(matcher, user_id: str) -> None:
